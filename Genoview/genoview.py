@@ -17,7 +17,36 @@ ffi = cffi.FFI()
 
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCES_DIR = BASE_DIR / "resources"
-DEFAULT_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000000.bvh"
+DEFAULT_HUMANML3D_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000000.bvh"
+DEFAULT_MODEL_BIN = "SMPL.bin"
+DEFAULT_SMPL_MODEL_PATH = BASE_DIR.parent / "272-dim-Motion-Representation" / "body_models" / "human_model_files"
+SMPL_MESH_TINT = Color(230, 172, 128, 255)
+SMPL_MODEL_NAMES = [
+    "Pelvis",
+    "Left_hip",
+    "Right_hip",
+    "Spine1",
+    "Left_knee",
+    "Right_knee",
+    "Spine2",
+    "Left_ankle",
+    "Right_ankle",
+    "Spine3",
+    "Left_foot",
+    "Right_foot",
+    "Neck",
+    "Left_collar",
+    "Right_collar",
+    "Head",
+    "Left_shoulder",
+    "Right_shoulder",
+    "Left_elbow",
+    "Right_elbow",
+    "Left_wrist",
+    "Right_wrist",
+    "Left_palm",
+    "Right_palm",
+]
 
 
 def resource_path_bytes(name: str) -> bytes:
@@ -47,10 +76,6 @@ def quat_wxyz_to_raylib_vector4(rotation):
     return Vector4(rotation[1], rotation[2], rotation[3], rotation[0])
 
 
-def quat_raylib_to_wxyz(rotation):
-    return np.asarray([rotation.w, rotation.x, rotation.y, rotation.z], dtype=np.float32)
-
-
 def infer_bvh_position_scale(bvh_data) -> float:
     offsets = np.asarray(bvh_data["offsets"], dtype=np.float32)
     if len(offsets) <= 1:
@@ -60,7 +85,7 @@ def infer_bvh_position_scale(bvh_data) -> float:
     mean_bone_length = float(np.mean(bone_lengths))
 
     # HumanML3D BVH exported from SMPL is already in meters (~0.1-0.4 per bone).
-    # Geno's bundled BVH is in centimeters (~8-40 per bone), so convert that to meters.
+    # Legacy BVH files in centimeters (~8-40 per bone) are converted to meters.
     return 0.01 if mean_bone_length > 2.0 else 1.0
 
 #----------------------------------------------------------------------------------
@@ -325,13 +350,13 @@ def EndGBuffer(windowWidth, windowHeight):
 
 
 #----------------------------------------------------------------------------------
-# Geno Character and Animation
+# Character Model and Animation
 #----------------------------------------------------------------------------------
 
 def FileRead(out, size, f):
     ffi.memmove(out, f.read(size), size)
 
-def LoadGenoModel(fileName):
+def LoadCharacterModel(fileName):
 
     model = Model()
     model.transform = MatrixIdentity()
@@ -358,6 +383,7 @@ def LoadGenoModel(fileName):
         model.meshes[0].boneIds = MemAlloc(model.meshes[0].vertexCount * 4 * ffi.sizeof("unsigned char"))
         model.meshes[0].boneWeights = MemAlloc(model.meshes[0].vertexCount * 4 * ffi.sizeof("float"))
         model.meshes[0].indices = MemAlloc(model.meshes[0].triangleCount * 3 * ffi.sizeof("unsigned short"))
+        model.meshes[0].colors = MemAlloc(model.meshes[0].vertexCount * 4 * ffi.sizeof("unsigned char"))
         model.meshes[0].animVertices = MemAlloc(model.meshes[0].vertexCount * 3 * ffi.sizeof("float"))
         model.meshes[0].animNormals = MemAlloc(model.meshes[0].vertexCount * 3 * ffi.sizeof("float"))
         model.bones =  MemAlloc(model.boneCount * ffi.sizeof(BoneInfo()))
@@ -369,6 +395,8 @@ def LoadGenoModel(fileName):
         FileRead(model.meshes[0].boneIds, ffi.sizeof("unsigned char") * model.meshes[0].vertexCount * 4, f)
         FileRead(model.meshes[0].boneWeights, ffi.sizeof("float") * model.meshes[0].vertexCount * 4, f)
         FileRead(model.meshes[0].indices, ffi.sizeof("unsigned short") * model.meshes[0].triangleCount * 3, f)
+        vertexColors = np.full((model.meshes[0].vertexCount, 4), 255, dtype=np.uint8)
+        ffi.memmove(model.meshes[0].colors, ffi.from_buffer(vertexColors), vertexColors.nbytes)
         ffi.memmove(model.meshes[0].animVertices, model.meshes[0].vertices, ffi.sizeof("float") * model.meshes[0].vertexCount * 3)
         ffi.memmove(model.meshes[0].animNormals, model.meshes[0].normals, ffi.sizeof("float") * model.meshes[0].vertexCount * 3)
         FileRead(model.bones, ffi.sizeof(BoneInfo()) * model.boneCount, f)
@@ -381,32 +409,6 @@ def LoadGenoModel(fileName):
     UploadMesh(ffi.addressof(model.meshes[0]), True)
     
     return model
-
-
-def GetModelBindPoseAsNumpyArrays(model):
-    
-    bindPos = np.zeros([model.boneCount, 3])
-    bindRot = np.zeros([model.boneCount, 4])
-    
-    for boneId in range(model.boneCount):
-        bindTransform = model.bindPose[boneId]
-        bindPos[boneId] = (bindTransform.translation.x, bindTransform.translation.y, bindTransform.translation.z)
-        bindRot[boneId] = quat_raylib_to_wxyz(bindTransform.rotation)
-        
-    return bindPos, bindRot
-    
-    
-def UpdateModelPoseFromNumpyArrays(model, bindPos, bindRot, animPos, animRot):
-    
-    meshPos = quat.mul_vec(animRot, quat.inv_mul_vec(bindRot, -bindPos)) + animPos
-    meshRot = quat.mul_inv(animRot, bindRot)
-    
-    matArray = np.frombuffer(ffi.buffer(
-        model.meshes[0].boneMatrices, model.boneCount * 4 * 4 * 4), 
-        dtype=np.float32).reshape([model.boneCount, 4, 4])
-    
-    matArray[:,:3,:3] = quat.to_xform(meshRot)
-    matArray[:,:3,3] = meshPos
 
 
 #----------------------------------------------------------------------------------
@@ -451,6 +453,118 @@ def DrawSkeleton(positions, rotations, parents, color):
                 Vector3(*positions[i]),
                 Vector3(*positions[parents[i]]),
                 color)
+
+
+def LoadBVHAnimation(path: Path):
+    data = bvh.load(str(path))
+    positionScale = infer_bvh_position_scale(data)
+    frameTime = max(float(data.get("frametime", 1.0 / 60.0)), 1e-6)
+    parents = data['parents']
+    localPositions = positionScale * data['positions'].copy().astype(np.float32)
+    localRotations = quat.unroll(quat.from_euler(np.radians(data['rotations']), order=data['order']))
+    globalRotations, globalPositions = quat.fk(localRotations, localPositions, parents)
+
+    print(f"Loaded BVH: {path}")
+    print(f"  position scale: {positionScale}")
+    print(f"  playback fps: {1.0 / frameTime:.2f}")
+
+    return {
+        "names": data["names"],
+        "parents": parents,
+        "localPositions": localPositions,
+        "localRotations": localRotations,
+        "globalRotations": globalRotations,
+        "globalPositions": globalPositions,
+        "frameTime": frameTime,
+    }
+
+
+def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    normals = np.zeros_like(vertices, dtype=np.float32)
+    tris = vertices[faces]
+    faceNormals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    faceNormals /= np.linalg.norm(faceNormals, axis=1, keepdims=True) + 1e-8
+    for corner in range(3):
+        np.add.at(normals, faces[:, corner], faceNormals)
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8
+    return normals.astype(np.float32)
+
+
+def quat_wxyz_to_axis_angle(rotations: np.ndarray) -> np.ndarray:
+    q = np.asarray(rotations, dtype=np.float32).copy()
+    q /= np.linalg.norm(q, axis=-1, keepdims=True) + 1e-8
+    q[q[..., 0] < 0.0] *= -1.0
+
+    xyz = q[..., 1:4]
+    sinHalfAngle = np.linalg.norm(xyz, axis=-1, keepdims=True)
+    angle = 2.0 * np.arctan2(sinHalfAngle, q[..., 0:1])
+    axisAngle = xyz * (angle / (sinHalfAngle + 1e-8))
+    axisAngle = np.where(sinHalfAngle > 1e-6, axisAngle, 2.0 * xyz)
+    return axisAngle.astype(np.float32)
+
+
+def LoadSMPLRuntimeAnimation(bvhAnimation):
+    import smplx
+    import torch
+
+    names = bvhAnimation["names"]
+    nameToIndex = {name: i for i, name in enumerate(names)}
+    missing = [name for name in SMPL_MODEL_NAMES if name not in nameToIndex]
+    if missing:
+        raise ValueError(f"BVH is missing SMPL joints required by smplx: {missing}")
+
+    bvhToSmplOrder = np.asarray([nameToIndex[name] for name in SMPL_MODEL_NAMES], dtype=np.int32)
+    axisAngles = quat_wxyz_to_axis_angle(bvhAnimation["localRotations"])[:, bvhToSmplOrder]
+
+    model = smplx.create(
+        model_path=str(DEFAULT_SMPL_MODEL_PATH),
+        model_type="smpl",
+        gender="NEUTRAL",
+        batch_size=1,
+    )
+    model.eval()
+
+    print("Loaded runtime SMPL model.")
+    print(f"  model path: {DEFAULT_SMPL_MODEL_PATH}")
+
+    return {
+        "model": model,
+        "torch": torch,
+        "axisAngles": axisAngles,
+        "translations": bvhAnimation["localPositions"][:, 0].astype(np.float32),
+        "faces": model.faces.astype(np.int32),
+    }
+
+
+def EvaluateSMPLRuntimeFrame(runtimeAnimation, frame: int):
+    torch = runtimeAnimation["torch"]
+    axisAngles = runtimeAnimation["axisAngles"][frame:frame + 1]
+    translation = runtimeAnimation["translations"][frame:frame + 1]
+    zeroTranslation = torch.zeros((1, 3), dtype=torch.float32)
+
+    with torch.no_grad():
+        output = runtimeAnimation["model"](
+            global_orient=torch.from_numpy(axisAngles[:, 0]),
+            body_pose=torch.from_numpy(axisAngles[:, 1:24].reshape(1, -1)),
+            transl=zeroTranslation,
+        )
+
+    vertices = output.vertices[0].detach().cpu().numpy().astype(np.float32)
+    pelvis = output.joints[0, 0].detach().cpu().numpy().astype(np.float32)
+    vertices += translation[0] - pelvis
+    normals = vertex_normals(vertices, runtimeAnimation["faces"])
+    return vertices, normals
+
+
+def UpdateModelStaticMesh(model, vertices: np.ndarray, normals: np.ndarray):
+    vertices = np.ascontiguousarray(vertices, dtype=np.float32)
+    normals = np.ascontiguousarray(normals, dtype=np.float32)
+
+    ffi.memmove(model.meshes[0].vertices, ffi.from_buffer(vertices), vertices.nbytes)
+    ffi.memmove(model.meshes[0].normals, ffi.from_buffer(normals), normals.nbytes)
+
+    UpdateMeshBuffer(model.meshes[0], 0, ffi.from_buffer(vertices), vertices.nbytes, 0)
+    UpdateMeshBuffer(model.meshes[0], 2, ffi.from_buffer(normals), normals.nbytes, 0)
     
 
 #----------------------------------------------------------------------------------
@@ -474,16 +588,6 @@ if __name__ == "__main__":
     shadowShaderLightClipNear = GetShaderLocation(shadowShader, b"lightClipNear")
     shadowShaderLightClipFar = GetShaderLocation(shadowShader, b"lightClipFar")
     
-    skinnedShadowShader = LoadShaderCompat("skinnedShadow.vs", "shadow.fs")
-    skinnedShadowShaderLightClipNear = GetShaderLocation(skinnedShadowShader, b"lightClipNear")
-    skinnedShadowShaderLightClipFar = GetShaderLocation(skinnedShadowShader, b"lightClipFar")
-    
-    skinnedBasicShader = LoadShaderCompat("skinnedBasic.vs", "basic.fs")
-    skinnedBasicShaderSpecularity = GetShaderLocation(skinnedBasicShader, b"specularity")
-    skinnedBasicShaderGlossiness = GetShaderLocation(skinnedBasicShader, b"glossiness")
-    skinnedBasicShaderCamClipNear = GetShaderLocation(skinnedBasicShader, b"camClipNear")
-    skinnedBasicShaderCamClipFar = GetShaderLocation(skinnedBasicShader, b"camClipFar")
-
     basicShader = LoadShaderCompat("basic.vs", "basic.fs")
     basicShaderSpecularity = GetShaderLocation(basicShader, b"specularity")
     basicShaderGlossiness = GetShaderLocation(basicShader, b"glossiness")
@@ -544,34 +648,27 @@ if __name__ == "__main__":
     groundModel = LoadModelFromMesh(groundMesh)
     groundPosition = Vector3(0.0, -0.01, 0.0)
     
-    genoModel = LoadGenoModel(resource_path_bytes("Geno.bin"))
-    genoPosition = Vector3(0.0, 0.0, 0.0)
-    
-    bindPos, bindRot = GetModelBindPoseAsNumpyArrays(genoModel)
+    characterModel = LoadCharacterModel(resource_path_bytes(DEFAULT_MODEL_BIN))
+    characterPosition = Vector3(0.0, 0.0, 0.0)
+    characterTint = SMPL_MESH_TINT
+    characterModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = WHITE
     
     # Animation
     
     # bvhData = bvh.load(str(RESOURCES_DIR / "ground1_subject1.bvh"))
-    bvhData = bvh.load(str(DEFAULT_BVH_PATH))
-    bvhPositionScale = infer_bvh_position_scale(bvhData)
-    bvhFrameTime = max(float(bvhData.get("frametime", 1.0 / 60.0)), 1e-6)
-    bvhFps = 1.0 / bvhFrameTime if bvhFrameTime > 0.0 else 60.0
-    print(f"Using BVH position scale: {bvhPositionScale}")
-    print(f"Using BVH playback fps: {bvhFps:.2f}")
-    
-    parents = bvhData['parents']
-    localPositions = bvhPositionScale * bvhData['positions'].copy().astype(np.float32)
-    localRotations = quat.unroll(quat.from_euler(np.radians(bvhData['rotations']), order=bvhData['order']))
-    globalRotations, globalPositions = quat.fk(localRotations, localPositions, parents)
+    bvhAnimation = LoadBVHAnimation(DEFAULT_HUMANML3D_BVH_PATH)
+    smplRuntimeAnimation = LoadSMPLRuntimeAnimation(bvhAnimation)
 
-    bvhJointCount = len(parents)
-    genoBoneCount = genoModel.boneCount
-    canSkinBVHToGeno = (bvhJointCount == genoBoneCount)
-    if not canSkinBVHToGeno:
-        print(
-            f"BVH joint count ({bvhJointCount}) does not match Geno bone count ({genoBoneCount}). "
-            "Falling back to skeleton-only preview."
-        )
+    parents = bvhAnimation["parents"]
+    localPositions = bvhAnimation["localPositions"]
+    globalRotations = bvhAnimation["globalRotations"]
+    globalPositions = bvhAnimation["globalPositions"]
+    bvhFrameTime = bvhAnimation["frameTime"]
+
+    print("Using runtime SMPL playback.")
+    sceneFloorY = float(np.min(EvaluateSMPLRuntimeFrame(smplRuntimeAnimation, 0)[0][:, 1]))
+    groundPosition.y = sceneFloorY - 0.01
+    print(f"Using scene floor y: {groundPosition.y:.4f}")
     
     animationFrame = 0
     animationTime = 0.0
@@ -609,7 +706,8 @@ if __name__ == "__main__":
     
     # UI
     
-    drawBoneTransformsPtr = ffi.new('bool*'); drawBoneTransformsPtr[0] = not canSkinBVHToGeno
+    drawBoneTransformsPtr = ffi.new('bool*'); drawBoneTransformsPtr[0] = False
+    drawHumanML3DSkeletonPtr = ffi.new('bool*'); drawHumanML3DSkeletonPtr[0] = False
     
     # Go
     
@@ -619,16 +717,14 @@ if __name__ == "__main__":
 
         animationTime = (animationTime + GetFrameTime()) % (len(localPositions) * bvhFrameTime)
         animationFrame = min(int(animationTime / bvhFrameTime), len(localPositions) - 1)
-        if canSkinBVHToGeno:
-            UpdateModelPoseFromNumpyArrays(
-                genoModel, bindPos, bindRot, 
-                globalPositions[animationFrame], globalRotations[animationFrame])
+        vertices, normals = EvaluateSMPLRuntimeFrame(smplRuntimeAnimation, animationFrame)
+        UpdateModelStaticMesh(characterModel, vertices, normals)
 
         # Shadow Light Tracks Character
         
         hipPosition = Vector3(*globalPositions[animationFrame][0])
         
-        shadowLight.target = Vector3(hipPosition.x, 0.0, hipPosition.z)
+        shadowLight.target = Vector3(hipPosition.x, groundPosition.y, hipPosition.z)
         shadowLight.position = Vector3Add(shadowLight.target, Vector3Scale(lightDir, -5.0))
 
         # Update Camera
@@ -661,15 +757,12 @@ if __name__ == "__main__":
         
         SetShaderValue(shadowShader, shadowShaderLightClipNear, lightClipNearPtr, SHADER_UNIFORM_FLOAT)
         SetShaderValue(shadowShader, shadowShaderLightClipFar, lightClipFarPtr, SHADER_UNIFORM_FLOAT)
-        SetShaderValue(skinnedShadowShader, skinnedShadowShaderLightClipNear, lightClipNearPtr, SHADER_UNIFORM_FLOAT)
-        SetShaderValue(skinnedShadowShader, skinnedShadowShaderLightClipFar, lightClipFarPtr, SHADER_UNIFORM_FLOAT)
         
         groundModel.materials[0].shader = shadowShader
         DrawModel(groundModel, groundPosition, 1.0, WHITE)
         
-        if canSkinBVHToGeno:
-            genoModel.materials[0].shader = skinnedShadowShader
-            DrawModel(genoModel, genoPosition, 1.0, WHITE)
+        characterModel.materials[0].shader = shadowShader
+        DrawModel(characterModel, characterPosition, 1.0, WHITE)
         
         EndShadowMap()
         
@@ -694,18 +787,12 @@ if __name__ == "__main__":
         SetShaderValue(basicShader, basicShaderGlossiness, glossinessPtr, SHADER_UNIFORM_FLOAT)
         SetShaderValue(basicShader, basicShaderCamClipNear, camClipNearPtr, SHADER_UNIFORM_FLOAT)
         SetShaderValue(basicShader, basicShaderCamClipFar, camClipFarPtr, SHADER_UNIFORM_FLOAT)
-        
-        SetShaderValue(skinnedBasicShader, skinnedBasicShaderSpecularity, specularityPtr, SHADER_UNIFORM_FLOAT)
-        SetShaderValue(skinnedBasicShader, skinnedBasicShaderGlossiness, glossinessPtr, SHADER_UNIFORM_FLOAT)
-        SetShaderValue(skinnedBasicShader, skinnedBasicShaderCamClipNear, camClipNearPtr, SHADER_UNIFORM_FLOAT)
-        SetShaderValue(skinnedBasicShader, skinnedBasicShaderCamClipFar, camClipFarPtr, SHADER_UNIFORM_FLOAT)        
-        
+
         groundModel.materials[0].shader = basicShader
         DrawModel(groundModel, groundPosition, 1.0, Color(190, 190, 190, 255))
         
-        if canSkinBVHToGeno:
-            genoModel.materials[0].shader = skinnedBasicShader
-            DrawModel(genoModel, genoPosition, 1.0, ORANGE)
+        characterModel.materials[0].shader = basicShader
+        DrawModel(characterModel, characterPosition, 1.0, characterTint)
         
         EndGBuffer(screenWidth, screenHeight)
         
@@ -836,11 +923,18 @@ if __name__ == "__main__":
         
         BeginMode3D(camera.cam3d)
         
-        if (not canSkinBVHToGeno) or drawBoneTransformsPtr[0]:
+        if drawBoneTransformsPtr[0]:
             DrawSkeleton(
                 globalPositions[animationFrame], 
                 globalRotations[animationFrame], 
-                parents, ORANGE if not canSkinBVHToGeno else GRAY)
+                parents, GRAY)
+
+        if drawHumanML3DSkeletonPtr[0]:
+            DrawSkeleton(
+                globalPositions[animationFrame],
+                globalRotations[animationFrame],
+                parents,
+                BLUE)
   
         EndMode3D()
 
@@ -878,11 +972,11 @@ if __name__ == "__main__":
         GuiLabel(Rectangle(30, 140, 150, 20), b"Altitude: %5.3f" % camera.altitude)
         GuiLabel(Rectangle(30, 160, 150, 20), b"Distance: %5.3f" % camera.distance)
   
-        GuiGroupBox(Rectangle(screenWidth - 260, 10, 240, 70), b"Rendering")
+        GuiGroupBox(Rectangle(screenWidth - 260, 10, 240, 120), b"Rendering")
 
         GuiCheckBox(Rectangle(screenWidth - 250, 20, 20, 20), b"Draw Transforms", drawBoneTransformsPtr)
-        if not canSkinBVHToGeno:
-            GuiLabel(Rectangle(screenWidth - 250, 45, 220, 20), b"Skeleton-only preview")
+        GuiCheckBox(Rectangle(screenWidth - 250, 45, 20, 20), b"Draw HumanML3D", drawHumanML3DSkeletonPtr)
+        GuiLabel(Rectangle(screenWidth - 250, 70, 220, 20), b"Mode: Runtime SMPL mesh")
 
   
         EndDrawing()
@@ -895,7 +989,7 @@ if __name__ == "__main__":
 
     UnloadShadowMap(shadowMap)
     
-    UnloadModel(genoModel)
+    UnloadModel(characterModel)
     UnloadModel(groundModel)
     
     UnloadShader(fxaaShader)    
@@ -903,8 +997,6 @@ if __name__ == "__main__":
     UnloadShader(ssaoShader) 
     UnloadShader(lightingShader)    
     UnloadShader(basicShader)
-    UnloadShader(skinnedBasicShader)
-    UnloadShader(skinnedShadowShader)
     UnloadShader(shadowShader)
     
     CloseWindow()

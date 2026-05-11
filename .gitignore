@@ -1,4 +1,5 @@
 .DS_Store
+*__pycache__*
 
 # datasets and ref projects
 /humanml3d_272
