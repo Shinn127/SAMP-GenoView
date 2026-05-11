@@ -1,6 +1,6 @@
 from pyray import (
-    Vector2, Vector3, Vector4, Transform, Matrix, Camera3D, 
-    Color, Rectangle, Model, ModelAnimation, Mesh, BoneInfo, 
+    Vector2, Vector3, Vector4, Transform, Matrix, Camera3D,
+    Color, Rectangle, Model, ModelAnimation, Mesh, BoneInfo, Material,
     Texture, RenderTexture)
 from raylib import *
 from raylib.defines import *
@@ -17,11 +17,10 @@ ffi = cffi.FFI()
 
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCES_DIR = BASE_DIR / "resources"
-DEFAULT_HUMANML3D_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000000.bvh"
-DEFAULT_MODEL_BIN = "SMPL.bin"
+DEFAULT_HUMANML3D_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000962.bvh"
 DEFAULT_SMPL_MODEL_PATH = BASE_DIR.parent / "272-dim-Motion-Representation" / "body_models" / "human_model_files"
-SMPL_MESH_TINT = Color(230, 172, 128, 255)
-SMPL_MODEL_NAMES = [
+SMPL_MESH_TINT = Color(194, 137, 3, 255)
+SMPL_BVH_JOINT_NAMES = [
     "Pelvis",
     "Left_hip",
     "Right_hip",
@@ -47,6 +46,26 @@ SMPL_MODEL_NAMES = [
     "Left_palm",
     "Right_palm",
 ]
+SMPLX_BODY_POSE_JOINT_NAMES = SMPL_BVH_JOINT_NAMES[1:-2]
+RUNTIME_MODEL_CONFIGS = {
+    "smpl": {
+        "label": "SMPL",
+        "model_bin": "SMPL.bin",
+        "model_type": "smpl",
+        "vertex_source": "SMPL_vertex_source.npy",
+        "body_pose_joint_names": SMPL_BVH_JOINT_NAMES[1:],
+        "use_pca": False,
+    },
+    "smplx": {
+        "label": "SMPL-X",
+        "model_bin": "SMPLX.bin",
+        "model_type": "smplx",
+        "vertex_source": "SMPLX_vertex_source.npy",
+        "body_pose_joint_names": SMPLX_BODY_POSE_JOINT_NAMES,
+        "use_pca": False,
+    },
+}
+DEFAULT_RUNTIME_MODEL_KEY = "smpl"
 
 
 def resource_path_bytes(name: str) -> bytes:
@@ -87,6 +106,40 @@ def infer_bvh_position_scale(bvh_data) -> float:
     # HumanML3D BVH exported from SMPL is already in meters (~0.1-0.4 per bone).
     # Legacy BVH files in centimeters (~8-40 per bone) are converted to meters.
     return 0.01 if mean_bone_length > 2.0 else 1.0
+
+
+def generate_cylindrical_texcoords(vertices: np.ndarray) -> np.ndarray:
+    vertices = np.asarray(vertices, dtype=np.float32)
+    center_x = float(np.mean(vertices[:, 0]))
+    center_z = float(np.mean(vertices[:, 2]))
+    x = vertices[:, 0] - center_x
+    z = vertices[:, 2] - center_z
+    angles = np.arctan2(x, -z)
+    u = np.mod(angles / (2.0 * np.pi) + 0.5, 1.0)
+
+    y = vertices[:, 1]
+    y_min = float(np.min(y))
+    y_span = max(float(np.max(y) - y_min), 1e-6)
+    v = (y - y_min) / y_span
+
+    return np.ascontiguousarray(np.stack([u, v], axis=1).astype(np.float32))
+
+
+def has_zero_texcoords(texcoords: np.ndarray) -> bool:
+    return bool(np.max(np.abs(texcoords)) < 1e-8)
+
+
+def load_model_faces(fileName) -> np.ndarray:
+    with open(fileName, "rb") as f:
+        vertexCount = struct.unpack('I', f.read(4))[0]
+        triangleCount = struct.unpack('I', f.read(4))[0]
+        f.read(4)  # boneCount
+        f.seek(vertexCount * 3 * 4, 1)
+        f.seek(vertexCount * 2 * 4, 1)
+        f.seek(vertexCount * 3 * 4, 1)
+        f.seek(vertexCount * 4, 1)
+        f.seek(vertexCount * 4 * 4, 1)
+        return np.frombuffer(f.read(triangleCount * 3 * 2), dtype=np.uint16).copy().reshape(triangleCount, 3)
 
 #----------------------------------------------------------------------------------
 # Camera
@@ -362,19 +415,33 @@ def LoadCharacterModel(fileName):
     model.transform = MatrixIdentity()
   
     with open(fileName, "rb") as f:
+        vertexCount = struct.unpack('I', f.read(4))[0]
+        triangleCount = struct.unpack('I', f.read(4))[0]
+        boneCount = struct.unpack('I', f.read(4))[0]
+
+        vertices = np.frombuffer(f.read(vertexCount * 3 * 4), dtype=np.float32).copy().reshape(vertexCount, 3)
+        texcoords = np.frombuffer(f.read(vertexCount * 2 * 4), dtype=np.float32).copy().reshape(vertexCount, 2)
+        normals = np.frombuffer(f.read(vertexCount * 3 * 4), dtype=np.float32).copy().reshape(vertexCount, 3)
+        boneIds = np.frombuffer(f.read(vertexCount * 4), dtype=np.uint8).copy().reshape(vertexCount, 4)
+        boneWeights = np.frombuffer(f.read(vertexCount * 4 * 4), dtype=np.float32).copy().reshape(vertexCount, 4)
+        indices = np.frombuffer(f.read(triangleCount * 3 * 2), dtype=np.uint16).copy().reshape(triangleCount, 3)
+
+        if has_zero_texcoords(texcoords):
+            texcoords = generate_cylindrical_texcoords(vertices)
+            print(f"Generated cylindrical UVs for {Path(fileName.decode()).name}.")
         
         model.materialCount = 1
-        model.materials = MemAlloc(model.materialCount * ffi.sizeof(Mesh()))
+        model.materials = MemAlloc(model.materialCount * ffi.sizeof(Material()))
         model.materials[0] = LoadMaterialDefault()
 
         model.meshCount = 1
-        model.meshMaterial = MemAlloc(model.meshCount * ffi.sizeof(Mesh()))
+        model.meshMaterial = MemAlloc(model.meshCount * ffi.sizeof("int"))
         model.meshMaterial[0] = 0
 
         model.meshes = MemAlloc(model.meshCount * ffi.sizeof(Mesh()))
-        model.meshes[0].vertexCount = struct.unpack('I', f.read(4))[0]
-        model.meshes[0].triangleCount = struct.unpack('I', f.read(4))[0]
-        model.boneCount = struct.unpack('I', f.read(4))[0]
+        model.meshes[0].vertexCount = vertexCount
+        model.meshes[0].triangleCount = triangleCount
+        model.boneCount = boneCount
 
         model.meshes[0].boneCount = model.boneCount
         model.meshes[0].vertices = MemAlloc(model.meshes[0].vertexCount * 3 * ffi.sizeof("float"))
@@ -389,16 +456,16 @@ def LoadCharacterModel(fileName):
         model.bones =  MemAlloc(model.boneCount * ffi.sizeof(BoneInfo()))
         model.bindPose =  MemAlloc(model.boneCount * ffi.sizeof(Transform()))
         
-        FileRead(model.meshes[0].vertices, ffi.sizeof("float") * model.meshes[0].vertexCount * 3, f)
-        FileRead(model.meshes[0].texcoords, ffi.sizeof("float") * model.meshes[0].vertexCount * 2, f)
-        FileRead(model.meshes[0].normals, ffi.sizeof("float") * model.meshes[0].vertexCount * 3, f)
-        FileRead(model.meshes[0].boneIds, ffi.sizeof("unsigned char") * model.meshes[0].vertexCount * 4, f)
-        FileRead(model.meshes[0].boneWeights, ffi.sizeof("float") * model.meshes[0].vertexCount * 4, f)
-        FileRead(model.meshes[0].indices, ffi.sizeof("unsigned short") * model.meshes[0].triangleCount * 3, f)
+        ffi.memmove(model.meshes[0].vertices, ffi.from_buffer(np.ascontiguousarray(vertices)), vertices.nbytes)
+        ffi.memmove(model.meshes[0].texcoords, ffi.from_buffer(np.ascontiguousarray(texcoords)), texcoords.nbytes)
+        ffi.memmove(model.meshes[0].normals, ffi.from_buffer(np.ascontiguousarray(normals)), normals.nbytes)
+        ffi.memmove(model.meshes[0].boneIds, ffi.from_buffer(np.ascontiguousarray(boneIds)), boneIds.nbytes)
+        ffi.memmove(model.meshes[0].boneWeights, ffi.from_buffer(np.ascontiguousarray(boneWeights)), boneWeights.nbytes)
+        ffi.memmove(model.meshes[0].indices, ffi.from_buffer(np.ascontiguousarray(indices)), indices.nbytes)
         vertexColors = np.full((model.meshes[0].vertexCount, 4), 255, dtype=np.uint8)
         ffi.memmove(model.meshes[0].colors, ffi.from_buffer(vertexColors), vertexColors.nbytes)
-        ffi.memmove(model.meshes[0].animVertices, model.meshes[0].vertices, ffi.sizeof("float") * model.meshes[0].vertexCount * 3)
-        ffi.memmove(model.meshes[0].animNormals, model.meshes[0].normals, ffi.sizeof("float") * model.meshes[0].vertexCount * 3)
+        ffi.memmove(model.meshes[0].animVertices, ffi.from_buffer(np.ascontiguousarray(vertices)), vertices.nbytes)
+        ffi.memmove(model.meshes[0].animNormals, ffi.from_buffer(np.ascontiguousarray(normals)), normals.nbytes)
         FileRead(model.bones, ffi.sizeof(BoneInfo()) * model.boneCount, f)
         FileRead(model.bindPose, ffi.sizeof(Transform()) * model.boneCount, f)
         
@@ -503,55 +570,78 @@ def quat_wxyz_to_axis_angle(rotations: np.ndarray) -> np.ndarray:
     return axisAngle.astype(np.float32)
 
 
-def LoadSMPLRuntimeAnimation(bvhAnimation):
+def LoadRuntimeAnimation(bvhAnimation, modelKey: str):
     import smplx
     import torch
 
+    config = RUNTIME_MODEL_CONFIGS[modelKey]
     names = bvhAnimation["names"]
     nameToIndex = {name: i for i, name in enumerate(names)}
-    missing = [name for name in SMPL_MODEL_NAMES if name not in nameToIndex]
+    missing = [name for name in SMPL_BVH_JOINT_NAMES if name not in nameToIndex]
     if missing:
-        raise ValueError(f"BVH is missing SMPL joints required by smplx: {missing}")
+        raise ValueError(f"BVH is missing SMPL joints required by {config['label']} playback: {missing}")
 
-    bvhToSmplOrder = np.asarray([nameToIndex[name] for name in SMPL_MODEL_NAMES], dtype=np.int32)
+    bvhToSmplOrder = np.asarray([nameToIndex[name] for name in SMPL_BVH_JOINT_NAMES], dtype=np.int32)
     axisAngles = quat_wxyz_to_axis_angle(bvhAnimation["localRotations"])[:, bvhToSmplOrder]
+    bodyPoseIndices = np.asarray([SMPL_BVH_JOINT_NAMES.index(name) for name in config["body_pose_joint_names"]], dtype=np.int32)
+    vertexSourcePath = RESOURCES_DIR / config["vertex_source"] if config["vertex_source"] else None
+    expandedVertexSource = np.load(vertexSourcePath).astype(np.int32) if vertexSourcePath and vertexSourcePath.exists() else None
+    meshFaces = load_model_faces(resource_path_bytes(config["model_bin"]))
 
     model = smplx.create(
         model_path=str(DEFAULT_SMPL_MODEL_PATH),
-        model_type="smpl",
+        model_type=config["model_type"],
         gender="NEUTRAL",
         batch_size=1,
+        use_pca=config["use_pca"],
     )
     model.eval()
 
-    print("Loaded runtime SMPL model.")
+    print(f"Loaded runtime {config['label']} model.")
     print(f"  model path: {DEFAULT_SMPL_MODEL_PATH}")
+    if expandedVertexSource is not None:
+        print(f"  expanded mesh vertices: {len(expandedVertexSource)}")
 
     return {
         "model": model,
         "torch": torch,
         "axisAngles": axisAngles,
+        "bodyPoseIndices": bodyPoseIndices,
         "translations": bvhAnimation["localPositions"][:, 0].astype(np.float32),
-        "faces": model.faces.astype(np.int32),
+        "faces": meshFaces.astype(np.int32),
+        "expandedVertexSource": expandedVertexSource,
+        "zeroHandPose": torch.zeros((1, 45), dtype=torch.float32),
+        "zeroFacePose": torch.zeros((1, 3), dtype=torch.float32),
+        "zeroExpression": torch.zeros((1, 10), dtype=torch.float32),
     }
 
 
-def EvaluateSMPLRuntimeFrame(runtimeAnimation, frame: int):
+def EvaluateRuntimeFrame(runtimeAnimation, frame: int):
     torch = runtimeAnimation["torch"]
     axisAngles = runtimeAnimation["axisAngles"][frame:frame + 1]
+    bodyPoseIndices = runtimeAnimation["bodyPoseIndices"]
     translation = runtimeAnimation["translations"][frame:frame + 1]
     zeroTranslation = torch.zeros((1, 3), dtype=torch.float32)
 
     with torch.no_grad():
         output = runtimeAnimation["model"](
             global_orient=torch.from_numpy(axisAngles[:, 0]),
-            body_pose=torch.from_numpy(axisAngles[:, 1:24].reshape(1, -1)),
+            body_pose=torch.from_numpy(axisAngles[:, bodyPoseIndices].reshape(1, -1)),
+            left_hand_pose=runtimeAnimation["zeroHandPose"],
+            right_hand_pose=runtimeAnimation["zeroHandPose"],
+            jaw_pose=runtimeAnimation["zeroFacePose"],
+            leye_pose=runtimeAnimation["zeroFacePose"],
+            reye_pose=runtimeAnimation["zeroFacePose"],
+            expression=runtimeAnimation["zeroExpression"],
             transl=zeroTranslation,
         )
 
     vertices = output.vertices[0].detach().cpu().numpy().astype(np.float32)
     pelvis = output.joints[0, 0].detach().cpu().numpy().astype(np.float32)
     vertices += translation[0] - pelvis
+    expandedVertexSource = runtimeAnimation["expandedVertexSource"]
+    if expandedVertexSource is not None:
+        vertices = vertices[expandedVertexSource]
     normals = vertex_normals(vertices, runtimeAnimation["faces"])
     return vertices, normals
 
@@ -593,7 +683,7 @@ if __name__ == "__main__":
     basicShaderGlossiness = GetShaderLocation(basicShader, b"glossiness")
     basicShaderCamClipNear = GetShaderLocation(basicShader, b"camClipNear")
     basicShaderCamClipFar = GetShaderLocation(basicShader, b"camClipFar")
-    
+
     lightingShader = LoadShaderCompat("post.vs", "lighting.fs")
     lightingShaderGBufferColor = GetShaderLocation(lightingShader, b"gbufferColor")
     lightingShaderGBufferNormal = GetShaderLocation(lightingShader, b"gbufferNormal")
@@ -648,16 +738,26 @@ if __name__ == "__main__":
     groundModel = LoadModelFromMesh(groundMesh)
     groundPosition = Vector3(0.0, -0.01, 0.0)
     
-    characterModel = LoadCharacterModel(resource_path_bytes(DEFAULT_MODEL_BIN))
     characterPosition = Vector3(0.0, 0.0, 0.0)
     characterTint = SMPL_MESH_TINT
-    characterModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = WHITE
     
     # Animation
     
     # bvhData = bvh.load(str(RESOURCES_DIR / "ground1_subject1.bvh"))
     bvhAnimation = LoadBVHAnimation(DEFAULT_HUMANML3D_BVH_PATH)
-    smplRuntimeAnimation = LoadSMPLRuntimeAnimation(bvhAnimation)
+    runtimeStates = {}
+    characterModels = {}
+    for modelKey, config in RUNTIME_MODEL_CONFIGS.items():
+        characterModel = LoadCharacterModel(resource_path_bytes(config["model_bin"]))
+        characterModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = WHITE
+        runtimeAnimation = LoadRuntimeAnimation(bvhAnimation, modelKey)
+        initialVertices, initialNormals = EvaluateRuntimeFrame(runtimeAnimation, 0)
+        UpdateModelStaticMesh(characterModel, initialVertices, initialNormals)
+        runtimeStates[modelKey] = {
+            "animation": runtimeAnimation,
+            "floorY": float(np.min(initialVertices[:, 1])),
+        }
+        characterModels[modelKey] = characterModel
 
     parents = bvhAnimation["parents"]
     localPositions = bvhAnimation["localPositions"]
@@ -665,8 +765,11 @@ if __name__ == "__main__":
     globalPositions = bvhAnimation["globalPositions"]
     bvhFrameTime = bvhAnimation["frameTime"]
 
-    print("Using runtime SMPL playback.")
-    sceneFloorY = float(np.min(EvaluateSMPLRuntimeFrame(smplRuntimeAnimation, 0)[0][:, 1]))
+    useSmplxPtr = ffi.new('bool*'); useSmplxPtr[0] = DEFAULT_RUNTIME_MODEL_KEY == "smplx"
+    activeRuntimeModelKey = DEFAULT_RUNTIME_MODEL_KEY if useSmplxPtr[0] else "smpl"
+
+    print(f"Using runtime {RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']} playback.")
+    sceneFloorY = runtimeStates[activeRuntimeModelKey]["floorY"]
     groundPosition.y = sceneFloorY - 0.01
     print(f"Using scene floor y: {groundPosition.y:.4f}")
     
@@ -717,8 +820,17 @@ if __name__ == "__main__":
 
         animationTime = (animationTime + GetFrameTime()) % (len(localPositions) * bvhFrameTime)
         animationFrame = min(int(animationTime / bvhFrameTime), len(localPositions) - 1)
-        vertices, normals = EvaluateSMPLRuntimeFrame(smplRuntimeAnimation, animationFrame)
-        UpdateModelStaticMesh(characterModel, vertices, normals)
+        requestedRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
+        if requestedRuntimeModelKey != activeRuntimeModelKey:
+            activeRuntimeModelKey = requestedRuntimeModelKey
+            groundPosition.y = runtimeStates[activeRuntimeModelKey]["floorY"] - 0.01
+            print(f"Switched runtime model to {RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']}.")
+            print(f"Using scene floor y: {groundPosition.y:.4f}")
+
+        activeRuntimeState = runtimeStates[activeRuntimeModelKey]
+        activeCharacterModel = characterModels[activeRuntimeModelKey]
+        vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], animationFrame)
+        UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
 
         # Shadow Light Tracks Character
         
@@ -761,8 +873,8 @@ if __name__ == "__main__":
         groundModel.materials[0].shader = shadowShader
         DrawModel(groundModel, groundPosition, 1.0, WHITE)
         
-        characterModel.materials[0].shader = shadowShader
-        DrawModel(characterModel, characterPosition, 1.0, WHITE)
+        activeCharacterModel.materials[0].shader = shadowShader
+        DrawModel(activeCharacterModel, characterPosition, 1.0, WHITE)
         
         EndShadowMap()
         
@@ -790,9 +902,9 @@ if __name__ == "__main__":
 
         groundModel.materials[0].shader = basicShader
         DrawModel(groundModel, groundPosition, 1.0, Color(190, 190, 190, 255))
-        
-        characterModel.materials[0].shader = basicShader
-        DrawModel(characterModel, characterPosition, 1.0, characterTint)
+
+        activeCharacterModel.materials[0].shader = basicShader
+        DrawModel(activeCharacterModel, characterPosition, 1.0, characterTint)
         
         EndGBuffer(screenWidth, screenHeight)
         
@@ -972,11 +1084,14 @@ if __name__ == "__main__":
         GuiLabel(Rectangle(30, 140, 150, 20), b"Altitude: %5.3f" % camera.altitude)
         GuiLabel(Rectangle(30, 160, 150, 20), b"Distance: %5.3f" % camera.distance)
   
-        GuiGroupBox(Rectangle(screenWidth - 260, 10, 240, 120), b"Rendering")
+        GuiGroupBox(Rectangle(screenWidth - 260, 10, 240, 145), b"Rendering")
 
         GuiCheckBox(Rectangle(screenWidth - 250, 20, 20, 20), b"Draw Transforms", drawBoneTransformsPtr)
         GuiCheckBox(Rectangle(screenWidth - 250, 45, 20, 20), b"Draw HumanML3D", drawHumanML3DSkeletonPtr)
-        GuiLabel(Rectangle(screenWidth - 250, 70, 220, 20), b"Mode: Runtime SMPL mesh")
+        GuiCheckBox(Rectangle(screenWidth - 250, 70, 20, 20), b"Use SMPL-X", useSmplxPtr)
+        GuiLabel(
+            Rectangle(screenWidth - 250, 100, 220, 20),
+            b"Mode: Runtime SMPL-X mesh" if activeRuntimeModelKey == "smplx" else b"Mode: Runtime SMPL mesh")
 
   
         EndDrawing()
@@ -989,7 +1104,8 @@ if __name__ == "__main__":
 
     UnloadShadowMap(shadowMap)
     
-    UnloadModel(characterModel)
+    for characterModel in characterModels.values():
+        UnloadModel(characterModel)
     UnloadModel(groundModel)
     
     UnloadShader(fxaaShader)    
