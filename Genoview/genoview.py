@@ -18,7 +18,9 @@ ffi = cffi.FFI()
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCES_DIR = BASE_DIR / "resources"
 DEFAULT_HUMANML3D_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000962.bvh"
+DEFAULT_HUMANML3D_MOTION_PATH = BASE_DIR.parent / "humanml3d_272" / "motion_data" / "000962.npy"
 DEFAULT_SMPL_MODEL_PATH = BASE_DIR.parent / "272-dim-Motion-Representation" / "body_models" / "human_model_files"
+DEFAULT_MOTION_REPRESENTATION_FPS = 30.0
 SMPL_MESH_TINT = Color(194, 137, 3, 255)
 SMPL_BVH_JOINT_NAMES = [
     "Pelvis",
@@ -66,6 +68,15 @@ RUNTIME_MODEL_CONFIGS = {
     },
 }
 DEFAULT_RUNTIME_MODEL_KEY = "smpl"
+ANIMATION_SOURCE_CONFIGS = {
+    "bvh": {
+        "label": "BVH",
+    },
+    "motion272": {
+        "label": "272 Motion",
+    },
+}
+DEFAULT_ANIMATION_SOURCE_KEY = "bvh"
 
 
 def resource_path_bytes(name: str) -> bytes:
@@ -140,6 +151,55 @@ def load_model_faces(fileName) -> np.ndarray:
         f.seek(vertexCount * 4, 1)
         f.seek(vertexCount * 4 * 4, 1)
         return np.frombuffer(f.read(triangleCount * 3 * 2), dtype=np.uint16).copy().reshape(triangleCount, 3)
+
+
+def normalize_vectors(vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    return vectors / (np.linalg.norm(vectors, axis=-1, keepdims=True) + eps)
+
+
+def rotation_6d_to_matrix_np(d6: np.ndarray) -> np.ndarray:
+    a1 = d6[..., :3]
+    a2 = d6[..., 3:]
+    b1 = normalize_vectors(a1)
+    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2 = normalize_vectors(b2)
+    b3 = np.cross(b1, b2, axis=-1)
+    return np.stack((b1, b2, b3), axis=-2).astype(np.float32)
+
+
+def accumulate_rotations(relativeRotations: np.ndarray) -> np.ndarray:
+    rotations = [relativeRotations[0]]
+    for rotation in relativeRotations[1:]:
+        rotations.append(np.matmul(rotation, rotations[-1]))
+    return np.asarray(rotations, dtype=np.float32)
+
+
+def recover_motion_representation(motion: np.ndarray, jointCount: int = 22):
+    motion = np.asarray(motion, dtype=np.float32)
+    frameCount = motion.shape[0]
+
+    rotation6d = motion[:, 8 + 6 * jointCount:8 + 12 * jointCount].reshape(frameCount, jointCount, 6)
+    rotationsMatrix = rotation_6d_to_matrix_np(rotation6d)
+    globalHeadingDiff = motion[:, 2:8].reshape(frameCount, 6)
+    headingRotations = accumulate_rotations(rotation_6d_to_matrix_np(globalHeadingDiff))
+    invHeadingRotations = np.transpose(headingRotations, (0, 2, 1))
+    rotationsMatrix[:, 0] = np.matmul(invHeadingRotations, rotationsMatrix[:, 0])
+
+    velocitiesRootXY = motion[:, :2]
+    positionsNoHeading = motion[:, 8:8 + 3 * jointCount].reshape(frameCount, jointCount, 3)
+    rootTranslation = np.zeros((frameCount, 3), dtype=np.float32)
+    rootTranslation[:, 0] = velocitiesRootXY[:, 0]
+    rootTranslation[:, 2] = velocitiesRootXY[:, 1]
+    rootTranslation[1:] = np.matmul(
+        invHeadingRotations[:-1],
+        rootTranslation[1:, :, None],
+    ).squeeze(-1)
+    rootTranslation = np.cumsum(rootTranslation, axis=0)
+    rootTranslation[:, 1] = positionsNoHeading[:, 0, 1]
+
+    axisAngles = quat.to_scaled_angle_axis(quat.from_xform(rotationsMatrix)).astype(np.float32)
+    axisAngles24 = np.concatenate([axisAngles, np.zeros((frameCount, 2, 3), dtype=np.float32)], axis=1)
+    return axisAngles24, rootTranslation.astype(np.float32)
 
 #----------------------------------------------------------------------------------
 # Camera
@@ -536,6 +596,8 @@ def LoadBVHAnimation(path: Path):
     print(f"  playback fps: {1.0 / frameTime:.2f}")
 
     return {
+        "sourceKey": "bvh",
+        "sourceLabel": ANIMATION_SOURCE_CONFIGS["bvh"]["label"],
         "names": data["names"],
         "parents": parents,
         "localPositions": localPositions,
@@ -543,6 +605,31 @@ def LoadBVHAnimation(path: Path):
         "globalRotations": globalRotations,
         "globalPositions": globalPositions,
         "frameTime": frameTime,
+        "frameCount": len(localPositions),
+        "rootPositions": globalPositions[:, 0].copy().astype(np.float32),
+    }
+
+
+def LoadMotionRepresentationAnimation(path: Path):
+    motion = np.load(path).astype(np.float32)
+    axisAngles, translations = recover_motion_representation(motion, jointCount=22)
+    frameTime = 1.0 / DEFAULT_MOTION_REPRESENTATION_FPS
+
+    print(f"Loaded 272 motion representation: {path}")
+    print(f"  shape: {motion.shape}")
+    print(f"  playback fps: {DEFAULT_MOTION_REPRESENTATION_FPS:.2f}")
+
+    return {
+        "sourceKey": "motion272",
+        "sourceLabel": ANIMATION_SOURCE_CONFIGS["motion272"]["label"],
+        "axisAngles": axisAngles,
+        "translations": translations,
+        "frameTime": frameTime,
+        "frameCount": len(axisAngles),
+        "rootPositions": translations.copy().astype(np.float32),
+        "parents": None,
+        "globalRotations": None,
+        "globalPositions": None,
     }
 
 
@@ -570,19 +657,24 @@ def quat_wxyz_to_axis_angle(rotations: np.ndarray) -> np.ndarray:
     return axisAngle.astype(np.float32)
 
 
-def LoadRuntimeAnimation(bvhAnimation, modelKey: str):
+def LoadRuntimeAnimation(animationData, modelKey: str):
     import smplx
     import torch
 
     config = RUNTIME_MODEL_CONFIGS[modelKey]
-    names = bvhAnimation["names"]
-    nameToIndex = {name: i for i, name in enumerate(names)}
-    missing = [name for name in SMPL_BVH_JOINT_NAMES if name not in nameToIndex]
-    if missing:
-        raise ValueError(f"BVH is missing SMPL joints required by {config['label']} playback: {missing}")
+    if "axisAngles" in animationData:
+        axisAngles = animationData["axisAngles"].astype(np.float32)
+        translations = animationData["translations"].astype(np.float32)
+    else:
+        names = animationData["names"]
+        nameToIndex = {name: i for i, name in enumerate(names)}
+        missing = [name for name in SMPL_BVH_JOINT_NAMES if name not in nameToIndex]
+        if missing:
+            raise ValueError(f"BVH is missing SMPL joints required by {config['label']} playback: {missing}")
+        bvhToSmplOrder = np.asarray([nameToIndex[name] for name in SMPL_BVH_JOINT_NAMES], dtype=np.int32)
+        axisAngles = quat_wxyz_to_axis_angle(animationData["localRotations"])[:, bvhToSmplOrder]
+        translations = animationData["localPositions"][:, 0].astype(np.float32)
 
-    bvhToSmplOrder = np.asarray([nameToIndex[name] for name in SMPL_BVH_JOINT_NAMES], dtype=np.int32)
-    axisAngles = quat_wxyz_to_axis_angle(bvhAnimation["localRotations"])[:, bvhToSmplOrder]
     bodyPoseIndices = np.asarray([SMPL_BVH_JOINT_NAMES.index(name) for name in config["body_pose_joint_names"]], dtype=np.int32)
     vertexSourcePath = RESOURCES_DIR / config["vertex_source"] if config["vertex_source"] else None
     expandedVertexSource = np.load(vertexSourcePath).astype(np.int32) if vertexSourcePath and vertexSourcePath.exists() else None
@@ -607,7 +699,7 @@ def LoadRuntimeAnimation(bvhAnimation, modelKey: str):
         "torch": torch,
         "axisAngles": axisAngles,
         "bodyPoseIndices": bodyPoseIndices,
-        "translations": bvhAnimation["localPositions"][:, 0].astype(np.float32),
+        "translations": translations,
         "faces": meshFaces.astype(np.int32),
         "expandedVertexSource": expandedVertexSource,
         "zeroHandPose": torch.zeros((1, 45), dtype=torch.float32),
@@ -744,32 +836,36 @@ if __name__ == "__main__":
     # Animation
     
     # bvhData = bvh.load(str(RESOURCES_DIR / "ground1_subject1.bvh"))
-    bvhAnimation = LoadBVHAnimation(DEFAULT_HUMANML3D_BVH_PATH)
+    animationSources = {
+        "bvh": LoadBVHAnimation(DEFAULT_HUMANML3D_BVH_PATH),
+        "motion272": LoadMotionRepresentationAnimation(DEFAULT_HUMANML3D_MOTION_PATH),
+    }
     runtimeStates = {}
     characterModels = {}
     for modelKey, config in RUNTIME_MODEL_CONFIGS.items():
         characterModel = LoadCharacterModel(resource_path_bytes(config["model_bin"]))
         characterModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = WHITE
-        runtimeAnimation = LoadRuntimeAnimation(bvhAnimation, modelKey)
-        initialVertices, initialNormals = EvaluateRuntimeFrame(runtimeAnimation, 0)
-        UpdateModelStaticMesh(characterModel, initialVertices, initialNormals)
-        runtimeStates[modelKey] = {
-            "animation": runtimeAnimation,
-            "floorY": float(np.min(initialVertices[:, 1])),
-        }
+        runtimeStates[modelKey] = {}
+        for sourceKey, animationSource in animationSources.items():
+            runtimeAnimation = LoadRuntimeAnimation(animationSource, modelKey)
+            initialVertices, initialNormals = EvaluateRuntimeFrame(runtimeAnimation, 0)
+            runtimeStates[modelKey][sourceKey] = {
+                "animation": runtimeAnimation,
+                "floorY": float(np.min(initialVertices[:, 1])),
+            }
+            if sourceKey == DEFAULT_ANIMATION_SOURCE_KEY:
+                UpdateModelStaticMesh(characterModel, initialVertices, initialNormals)
         characterModels[modelKey] = characterModel
 
-    parents = bvhAnimation["parents"]
-    localPositions = bvhAnimation["localPositions"]
-    globalRotations = bvhAnimation["globalRotations"]
-    globalPositions = bvhAnimation["globalPositions"]
-    bvhFrameTime = bvhAnimation["frameTime"]
-
     useSmplxPtr = ffi.new('bool*'); useSmplxPtr[0] = DEFAULT_RUNTIME_MODEL_KEY == "smplx"
+    use272MotionPtr = ffi.new('bool*'); use272MotionPtr[0] = DEFAULT_ANIMATION_SOURCE_KEY == "motion272"
     activeRuntimeModelKey = DEFAULT_RUNTIME_MODEL_KEY if useSmplxPtr[0] else "smpl"
+    activeAnimationSourceKey = DEFAULT_ANIMATION_SOURCE_KEY if use272MotionPtr[0] else "bvh"
 
-    print(f"Using runtime {RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']} playback.")
-    sceneFloorY = runtimeStates[activeRuntimeModelKey]["floorY"]
+    print(
+        f"Using {animationSources[activeAnimationSourceKey]['sourceLabel']} with "
+        f"{RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']} playback.")
+    sceneFloorY = runtimeStates[activeRuntimeModelKey][activeAnimationSourceKey]["floorY"]
     groundPosition.y = sceneFloorY - 0.01
     print(f"Using scene floor y: {groundPosition.y:.4f}")
     
@@ -818,23 +914,27 @@ if __name__ == "__main__":
     
         # Animation
 
-        animationTime = (animationTime + GetFrameTime()) % (len(localPositions) * bvhFrameTime)
-        animationFrame = min(int(animationTime / bvhFrameTime), len(localPositions) - 1)
+        requestedAnimationSourceKey = "motion272" if use272MotionPtr[0] else "bvh"
         requestedRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
+        if requestedAnimationSourceKey != activeAnimationSourceKey:
+            activeAnimationSourceKey = requestedAnimationSourceKey
+            print(f"Switched animation source to {animationSources[activeAnimationSourceKey]['sourceLabel']}.")
         if requestedRuntimeModelKey != activeRuntimeModelKey:
             activeRuntimeModelKey = requestedRuntimeModelKey
-            groundPosition.y = runtimeStates[activeRuntimeModelKey]["floorY"] - 0.01
             print(f"Switched runtime model to {RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']}.")
-            print(f"Using scene floor y: {groundPosition.y:.4f}")
-
-        activeRuntimeState = runtimeStates[activeRuntimeModelKey]
+        activeAnimationSource = animationSources[activeAnimationSourceKey]
+        activeRuntimeState = runtimeStates[activeRuntimeModelKey][activeAnimationSourceKey]
+        groundPosition.y = activeRuntimeState["floorY"] - 0.01
+        animationDuration = activeAnimationSource["frameCount"] * activeAnimationSource["frameTime"]
+        animationTime = (animationTime + GetFrameTime()) % animationDuration
+        animationFrame = min(int(animationTime / activeAnimationSource["frameTime"]), activeAnimationSource["frameCount"] - 1)
         activeCharacterModel = characterModels[activeRuntimeModelKey]
         vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], animationFrame)
         UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
 
         # Shadow Light Tracks Character
-        
-        hipPosition = Vector3(*globalPositions[animationFrame][0])
+
+        hipPosition = Vector3(*activeAnimationSource["rootPositions"][animationFrame])
         
         shadowLight.target = Vector3(hipPosition.x, groundPosition.y, hipPosition.z)
         shadowLight.position = Vector3Add(shadowLight.target, Vector3Scale(lightDir, -5.0))
@@ -1036,17 +1136,19 @@ if __name__ == "__main__":
         BeginMode3D(camera.cam3d)
         
         if drawBoneTransformsPtr[0]:
-            DrawSkeleton(
-                globalPositions[animationFrame], 
-                globalRotations[animationFrame], 
-                parents, GRAY)
+            if activeAnimationSource["globalPositions"] is not None:
+                DrawSkeleton(
+                    activeAnimationSource["globalPositions"][animationFrame],
+                    activeAnimationSource["globalRotations"][animationFrame],
+                    activeAnimationSource["parents"], GRAY)
 
         if drawHumanML3DSkeletonPtr[0]:
-            DrawSkeleton(
-                globalPositions[animationFrame],
-                globalRotations[animationFrame],
-                parents,
-                BLUE)
+            if activeAnimationSource["globalPositions"] is not None:
+                DrawSkeleton(
+                    activeAnimationSource["globalPositions"][animationFrame],
+                    activeAnimationSource["globalRotations"][animationFrame],
+                    activeAnimationSource["parents"],
+                    BLUE)
   
         EndMode3D()
 
@@ -1084,13 +1186,17 @@ if __name__ == "__main__":
         GuiLabel(Rectangle(30, 140, 150, 20), b"Altitude: %5.3f" % camera.altitude)
         GuiLabel(Rectangle(30, 160, 150, 20), b"Distance: %5.3f" % camera.distance)
   
-        GuiGroupBox(Rectangle(screenWidth - 260, 10, 240, 145), b"Rendering")
+        GuiGroupBox(Rectangle(screenWidth - 260, 10, 240, 170), b"Rendering")
 
         GuiCheckBox(Rectangle(screenWidth - 250, 20, 20, 20), b"Draw Transforms", drawBoneTransformsPtr)
         GuiCheckBox(Rectangle(screenWidth - 250, 45, 20, 20), b"Draw HumanML3D", drawHumanML3DSkeletonPtr)
         GuiCheckBox(Rectangle(screenWidth - 250, 70, 20, 20), b"Use SMPL-X", useSmplxPtr)
+        GuiCheckBox(Rectangle(screenWidth - 250, 95, 20, 20), b"Use 272 Motion", use272MotionPtr)
         GuiLabel(
-            Rectangle(screenWidth - 250, 100, 220, 20),
+            Rectangle(screenWidth - 250, 125, 220, 20),
+            f"Source: {animationSources[activeAnimationSourceKey]['sourceLabel']}".encode())
+        GuiLabel(
+            Rectangle(screenWidth - 250, 145, 220, 20),
             b"Mode: Runtime SMPL-X mesh" if activeRuntimeModelKey == "smplx" else b"Mode: Runtime SMPL mesh")
 
   
