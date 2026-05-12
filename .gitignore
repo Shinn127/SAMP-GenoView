@@ -1,8 +1,30 @@
+# macOS
 .DS_Store
-*__pycache__*
-.vscode
 
-# datasets and ref projects
-/humanml3d_272
-/MotionStreamer
-/272-dim-Motion-Representation
+# Editors
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Caches and local env state
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# DART-272 runtime artifacts
+/DART-272/__pycache__/
+/DART-272/dart272/__pycache__/
+/DART-272/.cache/
+/DART-272/outputs/
+
+# Local scratch scripts
+/mps.py
+
+# datasets and reference projects
+/humanml3d_272/
+/MotionStreamer/
+/272-dim-Motion-Representation/
+/DART-main/
