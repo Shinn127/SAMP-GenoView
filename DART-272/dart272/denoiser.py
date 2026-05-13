@@ -120,7 +120,7 @@ class DenoiserTransformer(nn.Module):
             activation=activation,
             batch_first=False,
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers, enable_nested_tensor=False)
         self.out = nn.Linear(h_dim, noise_shape[1])
 
     def mask_cond(self, cond: torch.Tensor, force_mask: bool = False) -> torch.Tensor:
@@ -139,3 +139,35 @@ class DenoiserTransformer(nn.Module):
         xseq = self.pos_enc(torch.cat([emb_time, emb_text, emb_history, emb_noise], dim=0))
         output = self.encoder(xseq)[-self.noise_shape[0] :]
         return self.out(output).permute(1, 0, 2)
+
+
+class ClassifierFreeGuidanceWrapper(nn.Module):
+    """Wraps a denoiser model to apply classifier-free guidance at inference time.
+
+    At each diffusion step, runs the model twice:
+      1. Conditional pass (with text embedding)
+      2. Unconditional pass (text embedding zeroed out)
+
+    Final output = uncond + guidance_scale * (cond - uncond)
+
+    The wrapped model must have been trained with cond_mask_prob > 0.
+    """
+
+    def __init__(self, model: nn.Module, guidance_scale: float = 5.0) -> None:
+        super().__init__()
+        self.model = model
+        self.guidance_scale = guidance_scale
+
+    def forward(self, x_t: torch.Tensor, timesteps: torch.Tensor, y: dict) -> torch.Tensor:
+        # Conditional forward
+        y["uncond"] = False
+        out_cond = self.model(x_t, timesteps, y)
+
+        # Unconditional forward
+        y["uncond"] = True
+        out_uncond = self.model(x_t, timesteps, y)
+
+        # Reset flag
+        y["uncond"] = False
+
+        return out_uncond + self.guidance_scale * (out_cond - out_uncond)

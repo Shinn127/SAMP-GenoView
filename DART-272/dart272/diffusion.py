@@ -68,3 +68,29 @@ class GaussianDiffusion:
             t = torch.full((shape[0],), step, device=device, dtype=torch.long)
             x_t = self.p_sample(model, x_t, t, model_kwargs)
         return x_t
+
+    def ddim_sample(self, model, x_t: torch.Tensor, t: torch.Tensor, t_prev: torch.Tensor, model_kwargs: dict) -> torch.Tensor:
+        """Single DDIM sampling step (deterministic)."""
+        x_start = model(x_t, t, model_kwargs["y"]).clamp(min=-5.0, max=5.0)
+        alpha_t = extract(self.alphas_cumprod, t, x_t.shape)
+        alpha_prev = extract(self.alphas_cumprod, t_prev, x_t.shape) if (t_prev >= 0).all() else torch.ones_like(alpha_t)
+        # For t_prev == -1 (final step), alpha_prev = 1.0 (no noise)
+        mask = (t_prev >= 0).float().view(t.shape[0], *((1,) * (x_t.ndim - 1)))
+        alpha_prev = mask * extract(self.alphas_cumprod, t_prev.clamp(min=0), x_t.shape) + (1 - mask)
+
+        # DDIM formula: x_{t-1} = sqrt(alpha_{t-1}) * x_0 + sqrt(1 - alpha_{t-1}) * eps_pred
+        eps_pred = (x_t - torch.sqrt(alpha_t) * x_start) / torch.sqrt(1.0 - alpha_t).clamp(min=1e-8)
+        x_prev = torch.sqrt(alpha_prev) * x_start + torch.sqrt((1.0 - alpha_prev).clamp(min=0)) * eps_pred
+        return x_prev
+
+    def ddim_sample_loop(self, model, shape: tuple[int, ...], model_kwargs: dict, device: torch.device,
+                         ddim_steps: int = 10) -> torch.Tensor:
+        """DDIM sampling with fewer steps than the full diffusion schedule."""
+        # Create evenly spaced timestep subsequence
+        step_indices = torch.linspace(0, self.num_steps - 1, ddim_steps, dtype=torch.long)
+        x_t = torch.randn(shape, device=device)
+        for i in reversed(range(ddim_steps)):
+            t = torch.full((shape[0],), step_indices[i].item(), device=device, dtype=torch.long)
+            t_prev = torch.full((shape[0],), step_indices[i - 1].item() if i > 0 else -1, device=device, dtype=torch.long)
+            x_t = self.ddim_sample(model, x_t, t, t_prev, model_kwargs)
+        return x_t
