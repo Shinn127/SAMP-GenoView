@@ -47,6 +47,7 @@ class HumanML3D272Dataset(Dataset):
         fps: int = 30,
         text_tolerance: float = 0.0,
         stride: int | None = None,
+        clip_cache_path: str | Path | None = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.motion_dir = self.data_root / "motion_data"
@@ -63,6 +64,15 @@ class HumanML3D272Dataset(Dataset):
 
         self.mean = torch.from_numpy(np.load(self.data_root / "mean_std" / "Mean.npy")).float()
         self.std = torch.from_numpy(np.load(self.data_root / "mean_std" / "Std.npy")).float().clamp(min=1e-6)
+
+        # Load precomputed CLIP embeddings if available
+        self.clip_cache = None
+        self.text_to_idx: dict[str, int] = {}
+        cache_path = Path(clip_cache_path) if clip_cache_path else self.data_root / ".cache" / "clip_embeddings.pt"
+        if cache_path.exists():
+            cache = torch.load(cache_path, map_location="cpu")
+            self.clip_cache = cache["embeddings"]  # [num_texts, 512]
+            self.text_to_idx = cache["text_to_idx"]
 
         split_ids = [line.strip() for line in (self.data_root / "split" / f"{split}.txt").read_text().splitlines() if line.strip()]
         self.motion_index: list[tuple[str, int]] = []
@@ -126,18 +136,31 @@ class HumanML3D272Dataset(Dataset):
         sample_id, start_frame = self.motion_index[index]
         motion = np.load(self.motion_dir / f"{sample_id}.npy")[start_frame : start_frame + self.seq_length]
         motion = torch.from_numpy(motion).float()
-        return {
+        texts = self._select_texts(sample_id, start_frame)
+
+        item = {
             "sample_id": sample_id,
             "start_frame": start_frame,
             "motion": self.normalize(motion),
-            "texts": self._select_texts(sample_id, start_frame),
+            "texts": texts,
         }
+
+        # If CLIP cache is available, include precomputed embeddings
+        if self.clip_cache is not None:
+            indices = [self.text_to_idx.get(t, 0) for t in texts]
+            item["text_embeddings"] = self.clip_cache[indices]  # [num_primitives, 512]
+
+        return item
 
 
 def collate_batch(batch: list[dict]) -> dict:
-    return {
+    result = {
         "sample_ids": [item["sample_id"] for item in batch],
         "start_frames": torch.tensor([item["start_frame"] for item in batch], dtype=torch.long),
         "motion": torch.stack([item["motion"] for item in batch], dim=0),
         "texts": [item["texts"] for item in batch],
     }
+    # Include precomputed text embeddings if available
+    if "text_embeddings" in batch[0]:
+        result["text_embeddings"] = torch.stack([item["text_embeddings"] for item in batch], dim=0)  # [B, num_primitives, 512]
+    return result

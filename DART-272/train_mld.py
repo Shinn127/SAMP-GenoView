@@ -303,7 +303,10 @@ def main() -> None:
                 x_t = diffusion.q_sample(x_start, t)
 
                 texts = [sample_texts[primitive_idx] for sample_texts in batch["texts"]]
-                text_embedding = encode_text(clip_model, texts, force_empty_zero=True)
+                if "text_embeddings" in batch:
+                    text_embedding = batch["text_embeddings"][:, primitive_idx].to(device)
+                else:
+                    text_embedding = encode_text(clip_model, texts, force_empty_zero=True)
                 y = {
                     "text_embedding": text_embedding,
                     "history_motion_normalized": history,
@@ -467,7 +470,10 @@ def _validate(
                 t = torch.randint(0, diffusion.num_steps, (motion.shape[0],), device=device)
                 x_t = diffusion.q_sample(x_start, t)
                 texts = [sample_texts[primitive_idx] for sample_texts in batch["texts"]]
-                text_embedding = encode_text(clip_model, texts, force_empty_zero=True)
+                if "text_embeddings" in batch:
+                    text_embedding = batch["text_embeddings"][:, primitive_idx].to(device)
+                else:
+                    text_embedding = encode_text(clip_model, texts, force_empty_zero=True)
                 x_start_pred = denoiser(
                     x_t,
                     t,
