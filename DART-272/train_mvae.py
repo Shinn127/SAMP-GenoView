@@ -28,8 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--kl-weight", type=float, default=1e-6)
-    parser.add_argument("--delta-weight", type=float, default=1.0,
-                        help="Weight for temporal delta consistency loss")
+    parser.add_argument("--delta-weight", type=float, default=100.0,
+                        help="Weight for joints temporal delta consistency loss")
+    parser.add_argument("--transl-delta-weight", type=float, default=100.0,
+                        help="Weight for root translation delta consistency loss")
+    parser.add_argument("--orient-delta-weight", type=float, default=100.0,
+                        help="Weight for heading orientation delta consistency loss")
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
     parser.add_argument("--latent-size", type=int, default=1)
@@ -80,28 +84,55 @@ def get_rollout_prob(step: int, stage1_steps: int, stage2_steps: int) -> float:
         return 1.0
 
 
-def temporal_delta_loss(pred: torch.Tensor, history_last_frame: torch.Tensor) -> torch.Tensor:
-    """Compute temporal delta consistency loss on the 272-dim HumanML3D features.
+def temporal_delta_loss(pred: torch.Tensor, history_last_frame: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Compute temporal delta consistency losses on the 272-dim representation.
 
-    The 272-dim layout (HumanML3D standard):
-      [4:67]   joint positions relative to root (21 joints * 3)
-      [67:130] joint velocities (21 joints * 3)
+    272-dim layout (from representation_272.py):
+      [0:2]     root XZ velocity (no heading)
+      [2:8]     heading angular velocity (6D rotation of frame-to-frame heading diff)
+      [8:74]    joint positions (22 joints * 3, no heading, at XZ origin)
+      [74:140]  joint velocities (22 joints * 3)
+      [140:272] joint rotations 6D (22 joints * 6)
 
-    The predicted frame-to-frame position difference should be consistent
-    with the predicted velocity channels.
+    Returns dict with three loss components:
+      - joints_delta: position[t] - position[t-1] should match velocity[t]
+      - transl_delta: root XZ position diff should match root XZ velocity
+      - orient_delta: heading rotation consistency (6D)
     """
     # Concatenate last history frame with predicted future: [B, F+1, D]
     seq = torch.cat([history_last_frame.unsqueeze(1), pred], dim=1).contiguous()
 
-    # Joint positions: dims [4:67] (21 joints * 3)
-    pos = seq[:, :, 4:67].contiguous()  # [B, F+1, 63]
-    # Actual frame-to-frame delta
-    calc_delta = (pos[:, 1:, :] - pos[:, :-1, :]).contiguous()  # [B, F, 63]
+    # 1. Joint positions delta vs velocity
+    pos = seq[:, :, 8:74].contiguous()  # [B, F+1, 66]
+    calc_joints_delta = (pos[:, 1:, :] - pos[:, :-1, :]).contiguous()  # [B, F, 66]
+    pred_joints_vel = pred[:, :, 74:140].contiguous()  # [B, F, 66]
+    joints_delta_loss = F.smooth_l1_loss(calc_joints_delta, pred_joints_vel)
 
-    # Predicted velocity channels: dims [67:130] (21 joints * 3)
-    pred_vel = pred[:, :, 67:130].contiguous()  # [B, F, 63]
+    # 2. Root XZ translation delta vs root velocity
+    # Root position is at joint index 0 within positions: [8:11] (x,y,z of root)
+    # But positions are already at XZ origin per frame, so root XZ is always 0.
+    # The root XZ velocity [0:2] represents the actual displacement.
+    # We check: root_pos_xz[t] - root_pos_xz[t-1] should be ~0 (since positions are re-centered)
+    # and root_vel[0:2] encodes the actual world displacement.
+    # For consistency: velocity of root joint in local frame [74:77] should match position delta [8:11]
+    root_pos = seq[:, :, 8:11].contiguous()  # [B, F+1, 3] (root joint position)
+    calc_root_delta = (root_pos[:, 1:, :] - root_pos[:, :-1, :]).contiguous()  # [B, F, 3]
+    pred_root_vel = pred[:, :, 74:77].contiguous()  # [B, F, 3] (root joint velocity)
+    transl_delta_loss = F.smooth_l1_loss(calc_root_delta, pred_root_vel)
 
-    return F.smooth_l1_loss(calc_delta, pred_vel)
+    # 3. Heading orientation delta consistency
+    # [2:8] is the 6D rotation of heading change. For the first frame it's identity [1,0,0,0,1,0].
+    # We can't easily compute a "ground truth" heading delta from positions alone,
+    # but we can enforce smoothness: the predicted heading delta should be temporally smooth.
+    heading_6d = pred[:, :, 2:8].contiguous()  # [B, F, 6]
+    heading_jerk = (heading_6d[:, 2:, :] - 2 * heading_6d[:, 1:-1, :] + heading_6d[:, :-2, :]).contiguous()
+    orient_delta_loss = F.smooth_l1_loss(heading_jerk, torch.zeros_like(heading_jerk))
+
+    return {
+        "joints_delta": joints_delta_loss,
+        "transl_delta": transl_delta_loss,
+        "orient_delta": orient_delta_loss,
+    }
 
 
 @torch.no_grad()
@@ -244,12 +275,15 @@ def main() -> None:
                 ).mean()
 
                 # Temporal delta consistency loss
-                delta_loss = temporal_delta_loss(
+                delta_losses = temporal_delta_loss(
                     train_set.denormalize(future_pred),
                     train_set.denormalize(history[:, -1:, :]).squeeze(1),
                 )
 
-                loss = rec_loss + args.kl_weight * kl_loss + args.delta_weight * delta_loss
+                loss = (rec_loss + args.kl_weight * kl_loss
+                        + args.delta_weight * delta_losses["joints_delta"]
+                        + args.transl_delta_weight * delta_losses["transl_delta"]
+                        + args.orient_delta_weight * delta_losses["orient_delta"])
                 loss_total = loss_total + loss
 
                 # Decide whether to use rollout for next primitive
@@ -383,11 +417,14 @@ def _validate(model: AutoMldVae, val_loader: DataLoader, args: argparse.Namespac
                     dist,
                     torch.distributions.Normal(torch.zeros_like(dist.loc), torch.ones_like(dist.scale)),
                 ).mean()
-                delta_loss = temporal_delta_loss(
+                delta_losses = temporal_delta_loss(
                     dataset.denormalize(future_pred),
                     dataset.denormalize(history[:, -1:, :]).squeeze(1),
                 )
-                loss_total = loss_total + rec_loss + args.kl_weight * kl_loss + args.delta_weight * delta_loss
+                loss_total = loss_total + (rec_loss + args.kl_weight * kl_loss
+                             + args.delta_weight * delta_losses["joints_delta"]
+                             + args.transl_delta_weight * delta_losses["transl_delta"]
+                             + args.orient_delta_weight * delta_losses["orient_delta"])
             val_losses.append(loss_total.item())
             if args.max_val_batches and batch_idx >= args.max_val_batches:
                 break

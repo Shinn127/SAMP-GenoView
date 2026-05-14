@@ -46,7 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-weight", type=float, default=1.0)
     parser.add_argument("--feature-weight", type=float, default=1.0)
     parser.add_argument("--delta-weight", type=float, default=1e4,
-                        help="Weight for temporal delta consistency loss on decoded features")
+                        help="Weight for joints temporal delta consistency loss")
+    parser.add_argument("--transl-delta-weight", type=float, default=1e4,
+                        help="Weight for root translation delta consistency loss")
+    parser.add_argument("--orient-delta-weight", type=float, default=1e4,
+                        help="Weight for heading orientation delta consistency loss")
     # Three-stage curriculum learning
     parser.add_argument("--stage1-steps", type=int, default=100000,
                         help="Stage 1: pure single-step denoising, no rollout")
@@ -109,16 +113,42 @@ def get_rollout_prob(step: int, stage1_steps: int, stage2_steps: int) -> float:
         return 1.0
 
 
-def temporal_delta_loss(pred: torch.Tensor, history_last_frame: torch.Tensor) -> torch.Tensor:
-    """Temporal delta consistency: position[t]-position[t-1] should match velocity[t].
+def temporal_delta_loss(pred: torch.Tensor, history_last_frame: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Compute temporal delta consistency losses on the 272-dim representation.
 
-    272-dim layout: positions [4:67], velocities [67:130].
+    272-dim layout (from representation_272.py):
+      [0:2]     root XZ velocity (no heading)
+      [2:8]     heading angular velocity (6D rotation)
+      [8:74]    joint positions (22 joints * 3)
+      [74:140]  joint velocities (22 joints * 3)
+      [140:272] joint rotations 6D (22 joints * 6)
+
+    Returns dict with three loss components.
     """
     seq = torch.cat([history_last_frame.unsqueeze(1), pred], dim=1).contiguous()
-    pos = seq[:, :, 4:67].contiguous()
-    calc_delta = (pos[:, 1:, :] - pos[:, :-1, :]).contiguous()
-    pred_vel = pred[:, :, 67:130].contiguous()
-    return F.smooth_l1_loss(calc_delta, pred_vel)
+
+    # 1. Joint positions delta vs velocity
+    pos = seq[:, :, 8:74].contiguous()
+    calc_joints_delta = (pos[:, 1:, :] - pos[:, :-1, :]).contiguous()
+    pred_joints_vel = pred[:, :, 74:140].contiguous()
+    joints_delta_loss = F.smooth_l1_loss(calc_joints_delta, pred_joints_vel)
+
+    # 2. Root translation delta
+    root_pos = seq[:, :, 8:11].contiguous()
+    calc_root_delta = (root_pos[:, 1:, :] - root_pos[:, :-1, :]).contiguous()
+    pred_root_vel = pred[:, :, 74:77].contiguous()
+    transl_delta_loss = F.smooth_l1_loss(calc_root_delta, pred_root_vel)
+
+    # 3. Heading orientation smoothness
+    heading_6d = pred[:, :, 2:8].contiguous()
+    heading_jerk = (heading_6d[:, 2:, :] - 2 * heading_6d[:, 1:-1, :] + heading_6d[:, :-2, :]).contiguous()
+    orient_delta_loss = F.smooth_l1_loss(heading_jerk, torch.zeros_like(heading_jerk))
+
+    return {
+        "joints_delta": joints_delta_loss,
+        "transl_delta": transl_delta_loss,
+        "orient_delta": orient_delta_loss,
+    }
 
 
 def main() -> None:
@@ -286,14 +316,17 @@ def main() -> None:
                 feature_loss = F.smooth_l1_loss(future_pred, future_gt.contiguous())
 
                 # Temporal delta consistency loss on decoded features
-                delta_loss = torch.tensor(0.0, device=device)
-                if args.delta_weight > 0:
-                    delta_loss = temporal_delta_loss(
+                delta_total = torch.tensor(0.0, device=device)
+                if args.delta_weight > 0 or args.transl_delta_weight > 0 or args.orient_delta_weight > 0:
+                    delta_losses = temporal_delta_loss(
                         train_set.denormalize(future_pred),
                         train_set.denormalize(history[:, -1:, :]).squeeze(1),
                     )
+                    delta_total = (args.delta_weight * delta_losses["joints_delta"]
+                                   + args.transl_delta_weight * delta_losses["transl_delta"]
+                                   + args.orient_delta_weight * delta_losses["orient_delta"])
 
-                loss = args.latent_weight * latent_loss + args.feature_weight * feature_loss + args.delta_weight * delta_loss
+                loss = args.latent_weight * latent_loss + args.feature_weight * feature_loss + delta_total
                 loss_total = loss_total + loss
 
                 # Decide whether to use rollout for next primitive
@@ -447,13 +480,16 @@ def _validate(
                 future_pred = vae.decode(latent_pred, history, mvae_cfg["future_length"], scale_latent=True).contiguous()
                 latent_loss = F.smooth_l1_loss(latent_pred, latent_gt.contiguous())
                 feature_loss = F.smooth_l1_loss(future_pred, future.contiguous())
-                delta_loss = torch.tensor(0.0, device=device)
-                if args.delta_weight > 0:
-                    delta_loss = temporal_delta_loss(
+                delta_total = torch.tensor(0.0, device=device)
+                if args.delta_weight > 0 or args.transl_delta_weight > 0 or args.orient_delta_weight > 0:
+                    delta_losses = temporal_delta_loss(
                         dataset.denormalize(future_pred),
                         dataset.denormalize(history[:, -1:, :]).squeeze(1),
                     )
-                loss_total = loss_total + args.latent_weight * latent_loss + args.feature_weight * feature_loss + args.delta_weight * delta_loss
+                    delta_total = (args.delta_weight * delta_losses["joints_delta"]
+                                   + args.transl_delta_weight * delta_losses["transl_delta"]
+                                   + args.orient_delta_weight * delta_losses["orient_delta"])
+                loss_total = loss_total + args.latent_weight * latent_loss + args.feature_weight * feature_loss + delta_total
             val_losses.append(loss_total.item())
             if args.max_val_batches and batch_idx >= args.max_val_batches:
                 break
