@@ -5,6 +5,7 @@ from pyray import (
 from raylib import *
 from raylib.defines import *
 
+import argparse
 import bvh
 import quat
 import numpy as np
@@ -74,6 +75,9 @@ ANIMATION_SOURCE_CONFIGS = {
     },
     "motion272": {
         "label": "272 Motion",
+    },
+    "live": {
+        "label": "Live Inference",
     },
 }
 DEFAULT_ANIMATION_SOURCE_KEY = "bvh"
@@ -754,6 +758,46 @@ def UpdateModelStaticMesh(model, vertices: np.ndarray, normals: np.ndarray):
 #----------------------------------------------------------------------------------
 
 if __name__ == "__main__":
+
+    # CLI arguments
+    parser = argparse.ArgumentParser(description="GenoView - Motion Visualization")
+    parser.add_argument("--motion", type=str, default=None,
+                        help="Path to 272-dim motion .npy file (overrides default)")
+    parser.add_argument("--bvh", type=str, default=None,
+                        help="Path to BVH file (overrides default)")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Override playback FPS for motion file")
+    # Live inference mode
+    parser.add_argument("--live", type=str, default=None,
+                        help="Path to MLD checkpoint for live text-to-motion inference")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="HumanML3D 272 data root (for mean/std). Default: humanml3d_272")
+    parser.add_argument("--guidance-scale", type=float, default=5.0,
+                        help="Classifier-free guidance scale for live mode")
+    parser.add_argument("--ddim-steps", type=int, default=5,
+                        help="DDIM sampling steps for live mode (fewer = faster)")
+    parser.add_argument("--seed-motion", type=str, default=None,
+                        help="Seed motion .npy for live mode initial pose")
+    cli_args = parser.parse_args()
+
+    motion_path = Path(cli_args.motion) if cli_args.motion else DEFAULT_HUMANML3D_MOTION_PATH
+    bvh_path = Path(cli_args.bvh) if cli_args.bvh else DEFAULT_HUMANML3D_BVH_PATH
+    if cli_args.fps:
+        DEFAULT_MOTION_REPRESENTATION_FPS = cli_args.fps
+
+    # Live inference engine (optional)
+    liveEngine = None
+    if cli_args.live:
+        from inference_engine import InferenceEngine
+        data_root = cli_args.data_root or str(BASE_DIR.parent / "humanml3d_272")
+        liveEngine = InferenceEngine(
+            mld_checkpoint=cli_args.live,
+            data_root=data_root,
+            guidance_scale=cli_args.guidance_scale,
+            ddim_steps=cli_args.ddim_steps,
+            seed_motion_path=cli_args.seed_motion or str(motion_path),
+        )
+        liveEngine.start()
     
     # Init Window
     
@@ -837,8 +881,8 @@ if __name__ == "__main__":
     
     # bvhData = bvh.load(str(RESOURCES_DIR / "ground1_subject1.bvh"))
     animationSources = {
-        "bvh": LoadBVHAnimation(DEFAULT_HUMANML3D_BVH_PATH),
-        "motion272": LoadMotionRepresentationAnimation(DEFAULT_HUMANML3D_MOTION_PATH),
+        "bvh": LoadBVHAnimation(bvh_path),
+        "motion272": LoadMotionRepresentationAnimation(motion_path),
     }
     runtimeStates = {}
     characterModels = {}
@@ -907,6 +951,23 @@ if __name__ == "__main__":
     
     drawBoneTransformsPtr = ffi.new('bool*'); drawBoneTransformsPtr[0] = False
     drawHumanML3DSkeletonPtr = ffi.new('bool*'); drawHumanML3DSkeletonPtr[0] = False
+
+    # Live mode state
+    liveMode = liveEngine is not None
+    liveFrameBuffer = []  # accumulated 272-dim frames for live playback
+    liveFrameIndex = 0
+    liveFrameTime = 1.0 / DEFAULT_MOTION_REPRESENTATION_FPS
+    liveAnimTime = 0.0
+    liveTextInput = ffi.new("char[256]")  # raygui text box buffer
+    liveTextInput[0:1] = b"\0"
+    liveTextEditMode = ffi.new('bool*'); liveTextEditMode[0] = False
+    liveStatusText = b"Enter text and press Enter to generate"
+    liveContinuousPtr = ffi.new('bool*'); liveContinuousPtr[0] = True
+    liveLastText = ""  # track last submitted text for seamless switching
+    if liveMode:
+        # Force 272 motion source in live mode
+        use272MotionPtr[0] = True
+        activeAnimationSourceKey = "motion272"
     
     # Go
     
@@ -914,27 +975,80 @@ if __name__ == "__main__":
     
         # Animation
 
-        requestedAnimationSourceKey = "motion272" if use272MotionPtr[0] else "bvh"
-        requestedRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
-        if requestedAnimationSourceKey != activeAnimationSourceKey:
-            activeAnimationSourceKey = requestedAnimationSourceKey
-            print(f"Switched animation source to {animationSources[activeAnimationSourceKey]['sourceLabel']}.")
-        if requestedRuntimeModelKey != activeRuntimeModelKey:
-            activeRuntimeModelKey = requestedRuntimeModelKey
-            print(f"Switched runtime model to {RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']}.")
-        activeAnimationSource = animationSources[activeAnimationSourceKey]
-        activeRuntimeState = runtimeStates[activeRuntimeModelKey][activeAnimationSourceKey]
-        groundPosition.y = activeRuntimeState["floorY"] - 0.01
-        animationDuration = activeAnimationSource["frameCount"] * activeAnimationSource["frameTime"]
-        animationTime = (animationTime + GetFrameTime()) % animationDuration
-        animationFrame = min(int(animationTime / activeAnimationSource["frameTime"]), activeAnimationSource["frameCount"] - 1)
-        activeCharacterModel = characterModels[activeRuntimeModelKey]
-        vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], animationFrame)
-        UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
+        # Live mode: consume frames from inference engine
+        if liveMode and liveEngine is not None:
+            # Drain available frames from engine into local buffer
+            while True:
+                frame = liveEngine.consume_frame()
+                if frame is None:
+                    break
+                liveFrameBuffer.append(frame)
+
+            # Advance playback in live buffer
+            if liveFrameBuffer:
+                liveAnimTime += GetFrameTime()
+                targetFrame = int(liveAnimTime / liveFrameTime)
+
+                # In continuous mode, trim consumed frames to bound memory
+                # Keep a small lookback window for smooth playback
+                if targetFrame > 60 and len(liveFrameBuffer) > 120:
+                    trimCount = targetFrame - 30
+                    liveFrameBuffer = liveFrameBuffer[trimCount:]
+                    liveAnimTime -= trimCount * liveFrameTime
+                    targetFrame -= trimCount
+
+                liveFrameIndex = min(targetFrame, len(liveFrameBuffer) - 1)
+
+                # Feed current frame to runtime animation for SMPL skinning
+                currentFrame272 = liveFrameBuffer[liveFrameIndex]
+                axisAngles, translations = recover_motion_representation(
+                    np.expand_dims(currentFrame272, 0), jointCount=22
+                )
+                activeRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
+                activeCharacterModel = characterModels[activeRuntimeModelKey]
+                runtimeAnim = runtimeStates[activeRuntimeModelKey]["motion272"]["animation"]
+
+                # Temporarily override the frame data for evaluation
+                runtimeAnim["axisAngles"][0:1] = axisAngles[0:1]
+                runtimeAnim["translations"][0:1] = translations[0:1]
+                vertices, normals = EvaluateRuntimeFrame(runtimeAnim, 0)
+                UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
+
+                # Track root for camera/shadow
+                hipPosition = Vector3(translations[0, 0], 0.0, translations[0, 2])
+                groundPosition.y = float(np.min(vertices[:, 1])) - 0.01
+            else:
+                # No frames yet, use static pose
+                activeRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
+                activeCharacterModel = characterModels[activeRuntimeModelKey]
+                activeRuntimeState = runtimeStates[activeRuntimeModelKey]["motion272"]
+                vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], 0)
+                UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
+                hipPosition = Vector3(0.0, 0.0, 0.0)
+
+        else:
+            # Standard playback mode (BVH or pre-loaded 272 motion)
+            requestedAnimationSourceKey = "motion272" if use272MotionPtr[0] else "bvh"
+            requestedRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
+            if requestedAnimationSourceKey != activeAnimationSourceKey:
+                activeAnimationSourceKey = requestedAnimationSourceKey
+                print(f"Switched animation source to {animationSources[activeAnimationSourceKey]['sourceLabel']}.")
+            if requestedRuntimeModelKey != activeRuntimeModelKey:
+                activeRuntimeModelKey = requestedRuntimeModelKey
+                print(f"Switched runtime model to {RUNTIME_MODEL_CONFIGS[activeRuntimeModelKey]['label']}.")
+            activeAnimationSource = animationSources[activeAnimationSourceKey]
+            activeRuntimeState = runtimeStates[activeRuntimeModelKey][activeAnimationSourceKey]
+            groundPosition.y = activeRuntimeState["floorY"] - 0.01
+            animationDuration = activeAnimationSource["frameCount"] * activeAnimationSource["frameTime"]
+            animationTime = (animationTime + GetFrameTime()) % animationDuration
+            animationFrame = min(int(animationTime / activeAnimationSource["frameTime"]), activeAnimationSource["frameCount"] - 1)
+            activeCharacterModel = characterModels[activeRuntimeModelKey]
+            vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], animationFrame)
+            UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
+
+            hipPosition = Vector3(*activeAnimationSource["rootPositions"][animationFrame])
 
         # Shadow Light Tracks Character
-
-        hipPosition = Vector3(*activeAnimationSource["rootPositions"][animationFrame])
         
         shadowLight.target = Vector3(hipPosition.x, groundPosition.y, hipPosition.z)
         shadowLight.position = Vector3Add(shadowLight.target, Vector3Scale(lightDir, -5.0))
@@ -1135,20 +1249,21 @@ if __name__ == "__main__":
         
         BeginMode3D(camera.cam3d)
         
-        if drawBoneTransformsPtr[0]:
-            if activeAnimationSource["globalPositions"] is not None:
-                DrawSkeleton(
-                    activeAnimationSource["globalPositions"][animationFrame],
-                    activeAnimationSource["globalRotations"][animationFrame],
-                    activeAnimationSource["parents"], GRAY)
+        if not liveMode:
+            if drawBoneTransformsPtr[0]:
+                if activeAnimationSource["globalPositions"] is not None:
+                    DrawSkeleton(
+                        activeAnimationSource["globalPositions"][animationFrame],
+                        activeAnimationSource["globalRotations"][animationFrame],
+                        activeAnimationSource["parents"], GRAY)
 
-        if drawHumanML3DSkeletonPtr[0]:
-            if activeAnimationSource["globalPositions"] is not None:
-                DrawSkeleton(
-                    activeAnimationSource["globalPositions"][animationFrame],
-                    activeAnimationSource["globalRotations"][animationFrame],
-                    activeAnimationSource["parents"],
-                    BLUE)
+            if drawHumanML3DSkeletonPtr[0]:
+                if activeAnimationSource["globalPositions"] is not None:
+                    DrawSkeleton(
+                        activeAnimationSource["globalPositions"][animationFrame],
+                        activeAnimationSource["globalRotations"][animationFrame],
+                        activeAnimationSource["parents"],
+                        BLUE)
   
         EndMode3D()
 
@@ -1194,18 +1309,87 @@ if __name__ == "__main__":
         GuiCheckBox(Rectangle(screenWidth - 250, 95, 20, 20), b"Use 272 Motion", use272MotionPtr)
         GuiLabel(
             Rectangle(screenWidth - 250, 125, 220, 20),
-            f"Source: {animationSources[activeAnimationSourceKey]['sourceLabel']}".encode())
+            b"Source: Live Inference" if liveMode else f"Source: {animationSources[activeAnimationSourceKey]['sourceLabel']}".encode())
         GuiLabel(
             Rectangle(screenWidth - 250, 145, 220, 20),
             b"Mode: Runtime SMPL-X mesh" if activeRuntimeModelKey == "smplx" else b"Mode: Runtime SMPL mesh")
 
+        # Live inference UI
+        if liveMode:
+            panelY = screenHeight - 110
+            GuiGroupBox(Rectangle(20, panelY, screenWidth - 40, 100), b"Live Inference - Continuous Control")
+            GuiLabel(Rectangle(30, panelY + 10, 80, 20), b"Prompt:")
+
+            # Text input box
+            if GuiTextBox(Rectangle(110, panelY + 10, screenWidth - 360, 24), liveTextInput, 255, liveTextEditMode[0]):
+                liveTextEditMode[0] = not liveTextEditMode[0]
+
+            # Seamless switch: change text without resetting (continuous transition)
+            switchPressed = GuiButton(Rectangle(screenWidth - 230, panelY + 10, 80, 24), b"Switch")
+            if switchPressed or (liveTextEditMode[0] and IsKeyPressed(KEY_ENTER)):
+                textBytes = ffi.string(liveTextInput).decode("utf-8").strip()
+                if textBytes:
+                    liveEngine.set_text(textBytes, interrupt=False)
+                    liveLastText = textBytes
+                    print(f"[Live] Seamless switch to: \"{textBytes}\"")
+
+            # Interrupt: discard buffer and regenerate immediately
+            interruptPressed = GuiButton(Rectangle(screenWidth - 140, panelY + 10, 100, 24), b"Interrupt")
+            if interruptPressed:
+                textBytes = ffi.string(liveTextInput).decode("utf-8").strip()
+                if textBytes:
+                    liveEngine.set_text(textBytes, interrupt=True)
+                    liveFrameBuffer.clear()
+                    liveFrameIndex = 0
+                    liveAnimTime = 0.0
+                    liveLastText = textBytes
+                    print(f"[Live] Interrupt! New prompt: \"{textBytes}\"")
+
+            # Second row: continuous mode toggle + reset + queue
+            GuiCheckBox(Rectangle(30, panelY + 40, 20, 20), b"Continuous", liveContinuousPtr)
+            liveEngine.continuous_mode = bool(liveContinuousPtr[0])
+
+            # Reset button: full reset to seed pose
+            resetPressed = GuiButton(Rectangle(170, panelY + 40, 70, 20), b"Reset")
+            if resetPressed:
+                liveEngine.reset_history(
+                    seed_motion=np.load(str(motion_path)) if motion_path.exists() else None
+                )
+                liveFrameBuffer.clear()
+                liveFrameIndex = 0
+                liveAnimTime = 0.0
+                print("[Live] Reset to initial pose.")
+
+            # Queue button: add current text to queue (generates N primitives then stops)
+            queuePressed = GuiButton(Rectangle(250, panelY + 40, 80, 20), b"Queue x4")
+            if queuePressed:
+                textBytes = ffi.string(liveTextInput).decode("utf-8").strip()
+                if textBytes:
+                    liveEngine.queue_text(textBytes, repeat=4)
+                    print(f"[Live] Queued 4x: \"{textBytes}\"")
+
+            # Status line
+            status = liveEngine.get_status()
+            queueInfo = f" | Queue: {status['queue_length']}" if status['queue_length'] > 0 else ""
+            modeInfo = "Continuous" if status['continuous_mode'] else "On-demand"
+            liveStatusText = (
+                f"{modeInfo} | \"{status['text']}\" | "
+                f"Buffer: {len(liveFrameBuffer)}f | "
+                f"Generated: {status['primitives_generated']} primitives"
+                f"{queueInfo}"
+            ).encode()
+            GuiLabel(Rectangle(30, panelY + 70, screenWidth - 80, 20), liveStatusText)
+
   
         EndDrawing()
+
+    # Cleanup
+    if liveEngine is not None:
+        liveEngine.stop()
 
     UnloadRenderTexture(lighted)
     UnloadRenderTexture(ssaoBack)
     UnloadRenderTexture(ssaoFront)
-    UnloadRenderTexture(lighted)
     UnloadGBuffer(gbuffer)
 
     UnloadShadowMap(shadowMap)
