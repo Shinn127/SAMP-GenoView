@@ -1,0 +1,9 @@
+{
+  "description": "World-space trajectory: pelvis walks to (2, 0.9, 1) over 80 frames. Use with --world-coords 1",
+  "waypoints": [
+    {"frame": 20, "joint": 0, "position": [0.5, 0.9, 0.25]},
+    {"frame": 40, "joint": 0, "position": [1.0, 0.9, 0.5]},
+    {"frame": 60, "joint": 0, "position": [1.5, 0.9, 0.75]},
+    {"frame": 78, "joint": 0, "position": [2.0, 0.9, 1.0]}
+  ]
+}

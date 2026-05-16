@@ -88,7 +88,7 @@ class InferenceEngine:
         device: str = "auto",
         guidance_scale: float = 5.0,
         ddim_steps: int = 5,
-        buffer_size: int = 64,
+        buffer_size: int = 16,
         seed_motion_path: str | Path | None = None,
         seed_start_frame: int = 0,
     ) -> None:
@@ -105,7 +105,16 @@ class InferenceEngine:
         # Resolve VAE checkpoint path (may be relative to training working dir)
         mvae_ckpt_path = Path(ckpt["vae_checkpoint"])
         if not mvae_ckpt_path.exists():
-            # Try relative to the MLD checkpoint's grandparent (typical: outputs/../)
+            # Try sibling directory with same folder name under outputs/
+            # e.g. stored "checkpoints/mvae_run2/checkpoint_best.pt"
+            #   → look in outputs/mvae_run2/checkpoint_best.pt
+            vae_dir_name = mvae_ckpt_path.parent.name
+            vae_file_name = mvae_ckpt_path.name
+            candidate = checkpoint_path.parent.parent / vae_dir_name / vae_file_name
+            if candidate.exists():
+                mvae_ckpt_path = candidate
+        if not mvae_ckpt_path.exists():
+            # Try relative to the MLD checkpoint's grandparent
             mvae_ckpt_path = checkpoint_path.parent.parent / mvae_ckpt_path.name
         if not mvae_ckpt_path.exists():
             # Try relative to DART-272 root (one level above outputs/)
@@ -114,7 +123,8 @@ class InferenceEngine:
         if not mvae_ckpt_path.exists():
             raise FileNotFoundError(
                 f"Cannot find VAE checkpoint. Stored path: '{ckpt['vae_checkpoint']}'. "
-                f"Tried: {mvae_ckpt_path}. Use --mvae-ckpt to specify explicitly."
+                f"Searched near: {checkpoint_path.parent.parent}. "
+                f"Pass --mvae-ckpt to specify explicitly."
             )
         mvae_cfg = load_json(mvae_ckpt_path.parent / "config.json")
         mvae_ckpt = torch.load(mvae_ckpt_path, map_location="cpu")
@@ -181,7 +191,7 @@ class InferenceEngine:
         self._text_lock = threading.Lock()
         self._running = False
         self._worker_thread: threading.Thread | None = None
-        self._buffer_low_threshold = self.future_length * 2  # refill when < 16 frames
+        self._buffer_low_threshold = self.future_length  # refill when < 8 frames
 
         # Continuous control state
         self._text_queue: deque[str] = deque()  # scheduled text sequence

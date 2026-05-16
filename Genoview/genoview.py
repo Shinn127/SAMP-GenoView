@@ -784,6 +784,8 @@ if __name__ == "__main__":
     bvh_path = Path(cli_args.bvh) if cli_args.bvh else DEFAULT_HUMANML3D_BVH_PATH
     if cli_args.fps:
         DEFAULT_MOTION_REPRESENTATION_FPS = cli_args.fps
+    if cli_args.motion:
+        DEFAULT_ANIMATION_SOURCE_KEY = "motion272"
 
     # Live inference engine (optional)
     liveEngine = None
@@ -964,6 +966,10 @@ if __name__ == "__main__":
     liveStatusText = b"Enter text and press Enter to generate"
     liveContinuousPtr = ffi.new('bool*'); liveContinuousPtr[0] = True
     liveLastText = ""  # track last submitted text for seamless switching
+    liveGlobalRootPos = np.zeros(3, dtype=np.float32)  # accumulated global root position
+    liveGlobalHeading = np.eye(3, dtype=np.float32)  # accumulated heading rotation matrix
+    liveLastFrameIndex = -1  # track which frame was last processed for accumulation
+    liveHoldFrame = None  # last rendered frame to hold during buffer refill
     if liveMode:
         # Force 272 motion source in live mode
         use272MotionPtr[0] = True
@@ -996,35 +1002,89 @@ if __name__ == "__main__":
                     liveFrameBuffer = liveFrameBuffer[trimCount:]
                     liveAnimTime -= trimCount * liveFrameTime
                     targetFrame -= trimCount
+                    liveLastFrameIndex -= trimCount
 
                 liveFrameIndex = min(targetFrame, len(liveFrameBuffer) - 1)
 
-                # Feed current frame to runtime animation for SMPL skinning
+                # Accumulate global root position for frames we haven't processed yet
+                # 272-dim layout: [0:2] = root XZ velocity, [2:8] = heading 6D rotation
+                while liveLastFrameIndex < liveFrameIndex:
+                    liveLastFrameIndex += 1
+                    frame272 = liveFrameBuffer[liveLastFrameIndex]
+                    # Root velocity is rotated by PREVIOUS frame's inverse heading
+                    # (matches recover_motion_representation: invHeadingRotations[:-1])
+                    invHeading = liveGlobalHeading.T
+                    localVel = np.array([frame272[0], 0.0, frame272[1]], dtype=np.float32)
+                    worldVel = invHeading @ localVel
+                    liveGlobalRootPos += worldVel
+                    # THEN accumulate heading rotation for this frame
+                    heading6d = frame272[2:8].reshape(1, 6)
+                    headingMat = rotation_6d_to_matrix_np(heading6d)[0]  # [3,3]
+                    liveGlobalHeading = headingMat @ liveGlobalHeading
+
+                # Get current frame's joint rotations via recover (single frame)
                 currentFrame272 = liveFrameBuffer[liveFrameIndex]
-                axisAngles, translations = recover_motion_representation(
+                axisAngles, _ = recover_motion_representation(
                     np.expand_dims(currentFrame272, 0), jointCount=22
                 )
+
+                # Apply accumulated global heading to root joint rotation
+                # recover_motion_representation on single frame only applies that frame's heading diff.
+                # We need to apply the full accumulated heading to match offline behavior:
+                #   rotationsMatrix[:, 0] = invHeadingRotations @ rotationsMatrix[:, 0]
+                invGlobalHeading = liveGlobalHeading.T
+                rootAxisAngle = axisAngles[0, 0]  # [3] axis-angle of root joint
+                # Convert root axis-angle to rotation matrix, apply heading, convert back
+                rootRotMat = quat.to_xform(quat.from_scaled_angle_axis(rootAxisAngle.reshape(1, 3)))[0]  # [3,3]
+                correctedRootMat = invGlobalHeading @ rootRotMat
+                correctedRootAA = quat.to_scaled_angle_axis(
+                    quat.from_xform(correctedRootMat.reshape(1, 3, 3))
+                )[0]  # [3]
+                axisAngles[0, 0] = correctedRootAA
+
+                # Use our accumulated global root position instead
+                globalTranslation = liveGlobalRootPos.copy()
+                # Y position from the representation (joint positions contain height)
+                positionsNoHeading = currentFrame272[8:8 + 3 * 22].reshape(22, 3)
+                globalTranslation[1] = positionsNoHeading[0, 1]
+
                 activeRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
                 activeCharacterModel = characterModels[activeRuntimeModelKey]
                 runtimeAnim = runtimeStates[activeRuntimeModelKey]["motion272"]["animation"]
 
-                # Temporarily override the frame data for evaluation
+                # Override frame data with correct global translation
                 runtimeAnim["axisAngles"][0:1] = axisAngles[0:1]
-                runtimeAnim["translations"][0:1] = translations[0:1]
+                runtimeAnim["translations"][0:1] = globalTranslation.reshape(1, 3)
                 vertices, normals = EvaluateRuntimeFrame(runtimeAnim, 0)
                 UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
 
                 # Track root for camera/shadow
-                hipPosition = Vector3(translations[0, 0], 0.0, translations[0, 2])
-                groundPosition.y = float(np.min(vertices[:, 1])) - 0.01
+                hipPosition = Vector3(globalTranslation[0], 0.0, globalTranslation[2])
+                # Save as hold frame for seamless switch
+                liveHoldFrame = (liveGlobalRootPos.copy(), currentFrame272.copy())
             else:
-                # No frames yet, use static pose
+                # No new frames yet — hold the last rendered pose (avoid flash to origin)
                 activeRuntimeModelKey = "smplx" if useSmplxPtr[0] else "smpl"
                 activeCharacterModel = characterModels[activeRuntimeModelKey]
-                activeRuntimeState = runtimeStates[activeRuntimeModelKey]["motion272"]
-                vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], 0)
-                UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
-                hipPosition = Vector3(0.0, 0.0, 0.0)
+                if liveHoldFrame is not None:
+                    holdPos, holdFrame272 = liveHoldFrame
+                    axisAngles, _ = recover_motion_representation(
+                        np.expand_dims(holdFrame272, 0), jointCount=22
+                    )
+                    runtimeAnim = runtimeStates[activeRuntimeModelKey]["motion272"]["animation"]
+                    runtimeAnim["axisAngles"][0:1] = axisAngles[0:1]
+                    positionsNoHeading = holdFrame272[8:8 + 3 * 22].reshape(22, 3)
+                    holdTranslation = holdPos.copy()
+                    holdTranslation[1] = positionsNoHeading[0, 1]
+                    runtimeAnim["translations"][0:1] = holdTranslation.reshape(1, 3)
+                    vertices, normals = EvaluateRuntimeFrame(runtimeAnim, 0)
+                    UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
+                    hipPosition = Vector3(holdPos[0], 0.0, holdPos[2])
+                else:
+                    activeRuntimeState = runtimeStates[activeRuntimeModelKey]["motion272"]
+                    vertices, normals = EvaluateRuntimeFrame(activeRuntimeState["animation"], 0)
+                    UpdateModelStaticMesh(activeCharacterModel, vertices, normals)
+                    hipPosition = Vector3(0.0, 0.0, 0.0)
 
         else:
             # Standard playback mode (BVH or pre-loaded 272 motion)
@@ -1324,26 +1384,21 @@ if __name__ == "__main__":
             if GuiTextBox(Rectangle(110, panelY + 10, screenWidth - 360, 24), liveTextInput, 255, liveTextEditMode[0]):
                 liveTextEditMode[0] = not liveTextEditMode[0]
 
-            # Seamless switch: change text without resetting (continuous transition)
+            # Seamless switch: change text, trim buffer to respond quickly
             switchPressed = GuiButton(Rectangle(screenWidth - 230, panelY + 10, 80, 24), b"Switch")
             if switchPressed or (liveTextEditMode[0] and IsKeyPressed(KEY_ENTER)):
                 textBytes = ffi.string(liveTextInput).decode("utf-8").strip()
                 if textBytes:
+                    # Change text without interrupting current generation
+                    # The next primitive will use the new text naturally
                     liveEngine.set_text(textBytes, interrupt=False)
+                    # Trim render buffer: keep only up to 8 frames ahead
+                    keepAhead = 8
+                    trimTo = liveFrameIndex + keepAhead
+                    if trimTo < len(liveFrameBuffer):
+                        liveFrameBuffer = liveFrameBuffer[:trimTo]
                     liveLastText = textBytes
-                    print(f"[Live] Seamless switch to: \"{textBytes}\"")
-
-            # Interrupt: discard buffer and regenerate immediately
-            interruptPressed = GuiButton(Rectangle(screenWidth - 140, panelY + 10, 100, 24), b"Interrupt")
-            if interruptPressed:
-                textBytes = ffi.string(liveTextInput).decode("utf-8").strip()
-                if textBytes:
-                    liveEngine.set_text(textBytes, interrupt=True)
-                    liveFrameBuffer.clear()
-                    liveFrameIndex = 0
-                    liveAnimTime = 0.0
-                    liveLastText = textBytes
-                    print(f"[Live] Interrupt! New prompt: \"{textBytes}\"")
+                    print(f"[Live] Switch to: \"{textBytes}\"")
 
             # Second row: continuous mode toggle + reset + queue
             GuiCheckBox(Rectangle(30, panelY + 40, 20, 20), b"Continuous", liveContinuousPtr)
@@ -1358,6 +1413,9 @@ if __name__ == "__main__":
                 liveFrameBuffer.clear()
                 liveFrameIndex = 0
                 liveAnimTime = 0.0
+                liveLastFrameIndex = -1
+                liveGlobalRootPos = np.zeros(3, dtype=np.float32)
+                liveGlobalHeading = np.eye(3, dtype=np.float32)
                 print("[Live] Reset to initial pose.")
 
             # Queue button: add current text to queue (generates N primitives then stops)
