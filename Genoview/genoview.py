@@ -18,8 +18,8 @@ ffi = cffi.FFI()
 
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCES_DIR = BASE_DIR / "resources"
-DEFAULT_HUMANML3D_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000962.bvh"
-DEFAULT_HUMANML3D_MOTION_PATH = BASE_DIR.parent / "humanml3d_272" / "motion_data" / "000962.npy"
+DEFAULT_HUMANML3D_BVH_PATH = BASE_DIR.parent / "humanml3d_272" / "bvh" / "000713.bvh"
+DEFAULT_HUMANML3D_MOTION_PATH = BASE_DIR.parent / "humanml3d_272" / "motion_data" / "000713.npy"
 DEFAULT_SMPL_MODEL_PATH = BASE_DIR.parent / "272-dim-Motion-Representation" / "body_models" / "human_model_files"
 DEFAULT_MOTION_REPRESENTATION_FPS = 30.0
 SMPL_MESH_TINT = Color(194, 137, 3, 255)

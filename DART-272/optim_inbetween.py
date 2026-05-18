@@ -51,13 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-motion", type=str, required=True,
                         help="Path to .npy motion file for start pose")
     parser.add_argument("--start-frame", type=int, default=0)
-    parser.add_argument("--goal-motion", type=str, required=True,
-                        help="Path to .npy motion file for goal keyframe")
-    parser.add_argument("--goal-frame", type=int, default=-1,
-                        help="Frame index in goal-motion to use as target (-1 = last)")
+    parser.add_argument("--goal-frames", type=str, nargs="+", required=True,
+                        help="Goal specifications as 'motion_path:source_frame:gen_frame'. "
+                             "motion_path = .npy file to extract target pose from. "
+                             "source_frame = frame index in that file ('last' for last frame). "
+                             "gen_frame = frame index in generated sequence where this pose should appear. "
+                             "Example: --goal-frames humanml3d_272/motion_data/000962.npy:120:120 "
+                             "humanml3d_272/motion_data/000003.npy:50:200")
     parser.add_argument("--text-prompt", type=str, default="walk forward")
     parser.add_argument("--num-primitives", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--output-name", type=str, default=None,
+                        help="Output filename stem (without extension). Default: auto-generated.")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=0)
     # Optimization parameters (aligned with DART-main defaults)
@@ -230,25 +235,56 @@ def main() -> None:
     # Diffusion
     diffusion = GaussianDiffusion(num_steps=cfg["diffusion_steps"])
 
-    # Load start and goal motions
+    # Load start motion
     start_raw = torch.from_numpy(np.load(args.start_motion)).float().to(device)
-    goal_raw = torch.from_numpy(np.load(args.goal_motion)).float().to(device)
-
     history = normalize(start_raw[args.start_frame : args.start_frame + history_length]).unsqueeze(0)
-    goal_frame_idx = args.goal_frame if args.goal_frame >= 0 else goal_raw.shape[0] - 1
-    goal_keyframe_272 = goal_raw[goal_frame_idx].unsqueeze(0)  # [1, 272] denormalized
 
-    # Compute world-space joint positions of the goal keyframe
-    goal_motion_full = goal_raw.unsqueeze(0)  # [1, T_goal, 272]
-    goal_world_joints = local_to_world_joints(goal_motion_full)  # [1, T_goal, 22, 3]
-    goal_joints_target = goal_world_joints[:, goal_frame_idx]  # [1, 22, 3]
-    print(f"  Goal world position (pelvis): {goal_joints_target[0, 0].tolist()}")
+    # Parse goal specifications: "motion_path:source_frame:gen_frame"
+    total_gen_frames = num_primitives * future_length
+    goal_targets = []  # list of (gen_frame_idx, target_joints [1, 22, 3])
+    goal_motion_cache = {}  # cache loaded motions to avoid re-loading
+
+    for spec in args.goal_frames:
+        parts = spec.rsplit(":", 2)  # split from right to handle paths with colons
+        if len(parts) != 3:
+            raise ValueError(f"Invalid goal spec '{spec}'. Expected 'motion_path:source_frame:gen_frame'")
+        motion_path, src_str, gen_str = parts
+
+        # Load and cache motion
+        if motion_path not in goal_motion_cache:
+            raw = torch.from_numpy(np.load(motion_path)).float().to(device)
+            world_joints = local_to_world_joints(raw.unsqueeze(0))  # [1, T, 22, 3]
+            goal_motion_cache[motion_path] = (raw, world_joints)
+        raw, world_joints = goal_motion_cache[motion_path]
+
+        # Resolve source frame
+        if src_str.strip() == "last":
+            src_frame = raw.shape[0] - 1
+        else:
+            src_frame = int(src_str)
+            if src_frame < 0:
+                src_frame = raw.shape[0] + src_frame
+        src_frame = min(src_frame, raw.shape[0] - 1)
+
+        # Resolve gen frame
+        if gen_str.strip() == "last":
+            gen_frame = total_gen_frames - 1
+        else:
+            gen_frame = int(gen_str)
+            if gen_frame < 0:
+                gen_frame = total_gen_frames + gen_frame
+        gen_frame = min(gen_frame, total_gen_frames - 1)
+
+        target_joints = world_joints[:, src_frame]  # [1, 22, 3]
+        goal_targets.append((gen_frame, target_joints))
+        pelvis_pos = target_joints[0, 0].tolist()
+        print(f"  Goal: {motion_path} frame {src_frame} → gen frame {gen_frame}, "
+              f"pelvis at [{pelvis_pos[0]:.3f}, {pelvis_pos[1]:.3f}, {pelvis_pos[2]:.3f}]")
 
     # Text embedding
     text_embedding = encode_text(clip_model, [args.text_prompt], force_empty_zero=True)
 
     # Initialize noise: single tensor [num_primitives, B, latent_size, latent_width]
-    # (aligned with DART-main's single noise tensor approach)
     noise_shape = (cfg["latent_size"], cfg["latent_width"])
     noise = torch.randn(num_primitives, 1, *noise_shape, device=device) * args.init_noise_scale
     noise.requires_grad_(True)
@@ -257,7 +293,7 @@ def main() -> None:
     criterion = torch.nn.HuberLoss(reduction='mean', delta=1.0)
 
     print(f"  Optimizing {num_primitives} primitives × {args.optim_steps} steps")
-    print(f"  Goal: frame {goal_frame_idx} from {args.goal_motion}")
+    print(f"  Goals: {len(goal_targets)} keyframes")
     print(f"  Text: '{args.text_prompt}'")
     print(f"  DDIM steps: {args.ddim_steps}, guidance: {args.guidance_scale}")
     print(f"  Unit grad: {bool(args.unit_grad)}, anneal LR: {bool(args.anneal_lr)}")
@@ -303,8 +339,11 @@ def main() -> None:
 
         # 1. Goal keyframe matching (world-space joint positions, HuberLoss)
         world_joints = local_to_world_joints(generated_denorm)  # [1, T, 22, 3]
-        pred_joints_last = world_joints[:, -1]  # [1, 22, 3]
-        loss_goal = criterion(pred_joints_last, goal_joints_target)
+        loss_goal = torch.tensor(0.0, device=device)
+        for gen_frame, target_joints in goal_targets:
+            pred_joints = world_joints[:, gen_frame]  # [1, 22, 3]
+            loss_goal = loss_goal + criterion(pred_joints, target_joints)
+        loss_goal = loss_goal / len(goal_targets)
 
         # 2. Jerk loss on joint positions [8:74]
         loss_jerk = torch.tensor(0.0, device=device)
@@ -346,7 +385,7 @@ def main() -> None:
 
     # Save
     output_dir = ensure_dir(args.output_dir or checkpoint_path.parent / "inbetween")
-    stem = f"inbetween_{args.text_prompt.replace(' ', '_')[:30]}_p{num_primitives}"
+    stem = args.output_name or f"inbetween_{args.text_prompt.replace(' ', '_')[:30]}_p{num_primitives}"
     np.save(output_dir / f"{stem}.npy", full_sequence_np)
 
     metadata = {
@@ -355,8 +394,8 @@ def main() -> None:
         "optim_steps": args.optim_steps,
         "start_motion": args.start_motion,
         "start_frame": args.start_frame,
-        "goal_motion": args.goal_motion,
-        "goal_frame": goal_frame_idx,
+        "goal_specs": args.goal_frames,
+        "goal_gen_frames": [gf for gf, _ in goal_targets],
         "shape": list(full_sequence_np.shape),
         "final_goal_loss": float(loss_goal.item()),
         "guidance_scale": args.guidance_scale,

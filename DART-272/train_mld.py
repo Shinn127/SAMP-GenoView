@@ -158,8 +158,9 @@ def main() -> None:
     save_dir = ensure_dir(args.save_dir)
     print(f"Using device: {device}")
 
-    mvae_ckpt = torch.load(args.mvae_ckpt, map_location="cpu")
-    mvae_cfg = load_json(Path(args.mvae_ckpt).parent / "config.json")
+    mvae_ckpt_path = Path(args.mvae_ckpt).expanduser().resolve()
+    mvae_ckpt = torch.load(mvae_ckpt_path, map_location="cpu")
+    mvae_cfg = load_json(mvae_ckpt_path.parent / "config.json")
 
     train_set = HumanML3D272Dataset(
         data_root=args.data_root,
@@ -394,7 +395,7 @@ def main() -> None:
                 payload = {
                     "global_step": global_step,
                     "epoch": epoch,
-                    "vae_checkpoint": str(args.mvae_ckpt),
+                    "vae_checkpoint": str(mvae_ckpt_path),
                     "denoiser_state": save_denoiser.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_loss": val_loss,
@@ -411,7 +412,7 @@ def main() -> None:
                 payload = {
                     "global_step": global_step,
                     "epoch": epoch,
-                    "vae_checkpoint": str(args.mvae_ckpt),
+                    "vae_checkpoint": str(mvae_ckpt_path),
                     "denoiser_state": save_denoiser.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "ema": ema_denoiser is not None,
@@ -431,7 +432,7 @@ def main() -> None:
     payload = {
         "global_step": global_step,
         "epoch": epoch,
-        "vae_checkpoint": str(args.mvae_ckpt),
+        "vae_checkpoint": str(mvae_ckpt_path),
         "denoiser_state": save_denoiser.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "val_loss": val_loss,

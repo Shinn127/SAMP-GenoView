@@ -13,12 +13,14 @@ __pycache__/
 .cache/
 .pytest_cache/
 .mypy_cache/
+.kiro
 
 # DART-272 runtime artifacts
 /DART-272/__pycache__/
 /DART-272/dart272/__pycache__/
 /DART-272/.cache/
 /DART-272/outputs/
+/DART-272/data/rl_seed/
 
 # Local scratch scripts
 /mps.py

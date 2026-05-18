@@ -1,0 +1,32 @@
+{
+  "description": "10-second walk with 3 pelvis waypoints from motion 000962",
+  "waypoints": [
+    {
+      "frame": 100,
+      "joint": 0,
+      "position": [
+        -0.041,
+        2.06,
+        0.061
+      ]
+    },
+    {
+      "frame": 200,
+      "joint": 0,
+      "position": [
+        1.373,
+        1.905,
+        0.512
+      ]
+    },
+    {
+      "frame": 280,
+      "joint": 0,
+      "position": [
+        1.437,
+        2.039,
+        0.627
+      ]
+    }
+  ]
+}

@@ -44,7 +44,7 @@ python DART-272/precompute_clip.py --data-root humanml3d_272
 ```bash
 python DART-272/train_mvae.py \
     --data-root humanml3d_272 \
-    --save-dir DART-272/outputs/mvae_run \
+    --save-dir DART-272/outputs/mvae_run2 \
     --stage1-steps 100000 \
     --stage2-steps 50000 \
     --stage3-steps 50000
@@ -67,8 +67,8 @@ Key parameters:
 Resume training:
 ```bash
 python DART-272/train_mvae.py \
-    --save-dir DART-272/outputs/mvae_run \
-    --resume DART-272/outputs/mvae_run/checkpoint_last.pt \
+    --save-dir DART-272/outputs/mvae_run2 \
+    --resume DART-272/outputs/mvae_run2/checkpoint_last.pt \
     --stage1-steps 100000 --stage2-steps 50000 --stage3-steps 50000
 ```
 
@@ -77,8 +77,8 @@ python DART-272/train_mvae.py \
 ```bash
 python DART-272/train_mld.py \
     --data-root humanml3d_272 \
-    --save-dir DART-272/outputs/mld_run \
-    --mvae-ckpt DART-272/outputs/mvae_run/checkpoint_best.pt \
+    --save-dir DART-272/outputs/mld_run2 \
+    --mvae-ckpt DART-272/outputs/mvae_run2/checkpoint_best.pt \
     --stage1-steps 100000 \
     --stage2-steps 100000 \
     --stage3-steps 100000
@@ -111,8 +111,8 @@ Both VAE and MLD use the same curriculum:
 ### TensorBoard
 
 ```bash
-tensorboard --logdir DART-272/outputs/mvae_run/tb_logs
-tensorboard --logdir DART-272/outputs/mld_run/tb_logs
+tensorboard --logdir DART-272/outputs/mvae_run2/tb_logs
+tensorboard --logdir DART-272/outputs/mld_run2/tb_logs
 ```
 
 ---
@@ -123,7 +123,7 @@ Generate motion from a text timeline:
 
 ```bash
 python DART-272/rollout.py \
-    --checkpoint DART-272/outputs/mld_run/checkpoint_best.pt \
+    --checkpoint DART-272/outputs/mld_run2/checkpoint_best.pt \
     --text-prompt "walk forward*8,turn left*2,walk forward*8" \
     --guidance-scale 5.0 \
     --ddim-steps 10
@@ -142,28 +142,69 @@ Each primitive = 8 frames at 30fps ≈ 0.27 seconds.
 
 ---
 
+## RL Control Policy
+
+Train a PPO policy that outputs 256D diffusion noise actions for goal reaching:
+
+```bash
+conda activate mcc
+python DART-272/control/train.py \
+    --checkpoint DART-272/outputs/mld_run2/checkpoint_best.pt \
+    --data-root humanml3d_272 \
+    --seed-data-path DART-272/data/rl_seed \
+    --save-dir DART-272/outputs/rl_control \
+    --num-envs 256 \
+    --num-steps 32 \
+    --num-iterations 500
+```
+
+`control/train.py` auto-creates `DART-272/data/rl_seed` from valid HumanML3D-272 training motions when the seed directory is missing. Each checkpoint stores the policy, optimizer, environment args, policy args, reward weights, and curriculum state.
+
+Evaluate a trained policy on a goal sequence:
+
+```bash
+python DART-272/control/test.py \
+    --policy-checkpoint DART-272/outputs/rl_control/checkpoint_last.pt \
+    --goal-json DART-main/data/test_locomotion/test_walk_long.json \
+    --output-dir DART-272/outputs/rl_control/test_rollouts
+```
+
+The test export pickle contains the 272D motion sequence, world-space joints, root translations, root orientations, success flags, and goal metadata for GenoView-side inspection.
+
+---
+
 ## Optimization-Based Applications
 
 ### Motion In-betweening
 
-Generate motion transitioning from a start pose to a goal keyframe (world-space joint matching):
+Generate motion transitioning through multiple goal keyframes (world-space joint matching):
 
 ```bash
 python DART-272/optim_inbetween.py \
-    --checkpoint DART-272/outputs/mld_run/checkpoint_best.pt \
-    --mvae-ckpt DART-272/outputs/mvae_run/checkpoint_best.pt \
+    --checkpoint DART-272/outputs/mld_run2/checkpoint_best.pt \
+    --mvae-ckpt DART-272/outputs/mvae_run2/checkpoint_best.pt \
     --start-motion humanml3d_272/motion_data/000962.npy --start-frame 0 \
-    --goal-motion humanml3d_272/motion_data/000962.npy --goal-frame 80 \
+    --goal-frames \
+        humanml3d_272/motion_data/000962.npy:120:120 \
+        humanml3d_272/motion_data/000003.npy:50:200 \
+        humanml3d_272/motion_data/000962.npy:last:295 \
     --text-prompt "walk forward" \
-    --num-primitives 10 \
+    --num-primitives 37 \
     --optim-steps 300 \
-    --ddim-steps 10
+    --ddim-steps 10 \
+    --output-name my_inbetween
 ```
+
+Goal format: `motion_path:source_frame:gen_frame`
+- `motion_path` = .npy file to extract target pose from (each goal can use a different file)
+- `source_frame` = frame index in that file (`last` for last frame)
+- `gen_frame` = frame index in generated sequence where this pose should appear
 
 Parameters:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--num-primitives` | 10 | Duration (×8 frames = 80 frames ≈ 2.7s) |
+| `--goal-frames` | required | One or more goal specs (see format above) |
+| `--num-primitives` | 10 | Duration (×8 frames) |
 | `--optim-steps` | 300 | Optimization iterations |
 | `--lr` | 0.01 | Learning rate |
 | `--guidance-scale` | 5.0 | CFG during optimization |
@@ -172,6 +213,8 @@ Parameters:
 | `--anneal-lr` | 1 | Linearly decay learning rate |
 | `--weight-jerk` | 0.0 | Smoothness loss weight |
 | `--weight-floor` | 0.0 | Floor penetration loss weight |
+| `--output-dir` | auto | Output directory |
+| `--output-name` | auto | Output filename stem (without extension) |
 
 ### Joint Trajectory Control
 
@@ -179,8 +222,8 @@ Control specific joints to follow world-space trajectory waypoints:
 
 ```bash
 python DART-272/optim_trajectory.py \
-    --checkpoint DART-272/outputs/mld_run/checkpoint_best.pt \
-    --mvae-ckpt DART-272/outputs/mvae_run/checkpoint_best.pt \
+    --checkpoint DART-272/outputs/mld_run2/checkpoint_best.pt \
+    --mvae-ckpt DART-272/outputs/mvae_run2/checkpoint_best.pt \
     --start-motion humanml3d_272/motion_data/000962.npy --start-frame 0 \
     --trajectory DART-272/data/traj_example.json \
     --text-prompt "walk forward" \
@@ -220,16 +263,16 @@ All outputs are `.npy` files with shape `[T, 272]`. Visualize with GenoView:
 
 ```bash
 # Rollout output
-python Genoview/genoview.py --motion DART-272/outputs/mld_run/rollout/walk_forwardx8.npy
+python Genoview/genoview.py --motion DART-272/outputs/mld_run2/rollout/walk_forwardx8.npy
 
 # In-betweening output
-python Genoview/genoview.py --motion DART-272/outputs/mld_run/inbetween/inbetween_walk_forward_p10.npy
+python Genoview/genoview.py --motion DART-272/outputs/mld_run2/inbetween/inbetween_walk_forward_p10.npy
 
 # Trajectory output
-python Genoview/genoview.py --motion DART-272/outputs/mld_run/trajectory/traj_walk_forward_p10.npy
+python Genoview/genoview.py --motion DART-272/outputs/mld_run2/trajectory/traj_walk_forward_p10.npy
 
 # Live inference (real-time text-to-motion)
-python Genoview/genoview.py --live DART-272/outputs/mld_run/checkpoint_best.pt
+python Genoview/genoview.py --live DART-272/outputs/mld_run2/checkpoint_best.pt
 ```
 
 ---
@@ -272,6 +315,5 @@ DART-272/
 
 ## Not Yet Implemented
 
-- RL control policy (PPO goal reaching)
 - Scene interaction (SDF collision/contact)
 - Quantitative evaluation (FID, diversity)
