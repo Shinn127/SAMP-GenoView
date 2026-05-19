@@ -34,7 +34,7 @@ class EnvArgs:
     ddim_steps: int = 10
     success_threshold: float = 0.3
     terminate_threshold: float = 100.0
-    obs_goal_angle_clip: float = 60.0
+    obs_goal_angle_clip: float = 180.0
     obs_goal_dist_clip: float = 5.0
     enable_export: bool = False
     export_interval: int = 100
@@ -58,7 +58,7 @@ class PolicyArgs:
 
     latent_dim: int = 512
     n_blocks: int = 2
-    activation: str = "tanh"
+    activation: str = "lrelu"
     min_log_std: float = -1.0
     max_log_std: float = 1.0
     use_tanh_scale: bool = False
@@ -77,7 +77,7 @@ class GoalSchedulerArgs:
         angle_init: Initial goal angle range (degrees).
         angle_delta: Angle range increment per curriculum step (degrees).
         angle_max: Maximum goal angle range (degrees).
-        curriculum_interval: Global timesteps between curriculum steps.
+        curriculum_interval: Training iterations between curriculum steps.
     """
 
     dist_min: float = 0.5
@@ -87,7 +87,7 @@ class GoalSchedulerArgs:
     angle_init: float = 0.0
     angle_delta: float = 120.0
     angle_max: float = 360.0
-    curriculum_interval: int = 50000
+    curriculum_interval: int = 10000
 
 
 @dataclass
@@ -99,14 +99,26 @@ class RewardWeights:
         weight_dist: Weight for distance reduction reward.
         weight_foot_floor: Weight for foot-floor contact penalty.
         weight_skate: Weight for foot skating penalty.
+        weight_skate_rigid: Weight for maximum foot skating penalty.
         weight_orient: Weight for orientation alignment reward.
+        weight_rotation: Weight for body rotation smoothness reward.
+        weight_jerk: Weight for joint jerk reward.
+        weight_delta: Weight for 272D delta-consistency reward.
+        weight_skate_delta: Curriculum increment for weight_skate.
+        weight_skate_max: Maximum curriculum value for weight_skate.
     """
 
     weight_success: float = 10.0
     weight_dist: float = 1.0
     weight_foot_floor: float = 1.0
     weight_skate: float = 1.0
+    weight_skate_delta: float = 0.0
+    weight_skate_max: float = 1.0
+    weight_skate_rigid: float = 0.0
     weight_orient: float = 1.0
+    weight_rotation: float = 0.0
+    weight_jerk: float = 0.0
+    weight_delta: float = 0.0
 
 
 @dataclass
@@ -148,9 +160,12 @@ class TrainArgs:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
+    clip_vloss: bool = True
+    norm_adv: bool = True
     vf_coef: float = 0.5
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0
     max_grad_norm: float = 0.5
+    target_kl: float | None = None
     update_epochs: int = 10
     minibatch_size: int = 1024
     num_steps: int = 32

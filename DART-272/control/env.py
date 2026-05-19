@@ -228,6 +228,7 @@ class Dart272Env:
         self.goal_text_embedding = torch.zeros(B, 512, device=device)
         self.steps = torch.zeros(B, dtype=torch.long, device=device)
         self.prev_pelvis_pos = torch.zeros(B, 3, device=device)
+        self.history_world_joints = torch.zeros(B, self.history_length, 22, 3, device=device)
         self.floor_height = torch.zeros(B, device=device)
         self.global_iteration = 0
         self.global_step = 0
@@ -406,13 +407,15 @@ class Dart272Env:
             pelvis_world = local_joints[0, 0, 0, :]  # [3]
             pelvis_world = pelvis_world + self.transf_transl[idx]
             self.prev_pelvis_pos[idx] = pelvis_world
+            self.history_world_joints[idx] = local_joints[0] + self.transf_transl[idx].view(1, 1, 3)
             self.sequences[idx] = self._new_rollout_buffer()
             self.sequences[idx]["motion"].append(self.motion_history_denorm[idx].detach().cpu())
+            self.sequences[idx]["world_joints"].append(self.history_world_joints[idx].detach().cpu())
             self.sequences[idx]["transf_rotmat"].append(
                 self.transf_rotmat[idx].unsqueeze(0).repeat(self.history_length, 1, 1).detach().cpu()
             )
             self.sequences[idx]["transf_transl"].append(
-                self.prev_pelvis_pos[idx].unsqueeze(0).repeat(self.history_length, 1).detach().cpu()
+                self.transf_transl[idx].unsqueeze(0).repeat(self.history_length, 1).detach().cpu()
             )
 
         if goal_location is not None:
@@ -535,6 +538,8 @@ class Dart272Env:
         # --- 5. Extract world-space joints using the transform at segment start ---
         start_rotmat = self.transf_rotmat.clone()
         start_transl = self.transf_transl.clone()
+        history_world_joints = self.history_world_joints.clone()
+        prev_motion_frame = self.motion_history_denorm[:, -1, :].clone()
 
         # Extract heading deltas and root velocity from the generated frames
         heading_6d = motion_denorm[:, :, 2:8]  # [B, 8, 6]
@@ -574,12 +579,17 @@ class Dart272Env:
             goal_location=self.goal_location,
             goal_texts=self.goal_text,
             weights=self.reward_weights,
+            success_threshold=self.args.success_threshold,
+            history_world_joints=history_world_joints,
+            prev_motion_frame=prev_motion_frame,
+            future_motion=motion_denorm,
         )
 
         # --- 8. Update state ---
         # Update motion history with last 2 frames (normalized)
         self.motion_history = motion_norm[:, -2:, :].clone()  # [B, 2, 272]
         self.motion_history_denorm = motion_denorm[:, -2:, :].clone()  # [B, 2, 272]
+        self.history_world_joints = world_joints[:, -self.history_length :, :, :].clone()
 
         # Update prev_pelvis_pos with last frame pelvis world position
         self.prev_pelvis_pos = world_joints[:, -1, 0, :].clone()  # [B, 3]
@@ -626,23 +636,12 @@ class Dart272Env:
         }
 
         # --- 10. Assign a new goal when the current one is reached ---
-        success_live = success_mask & ~(terminated | truncated)
-        if success_live.any():
-            success_idx = torch.where(success_live)[0]
-            if next_goal_location is not None:
-                next_goals = torch.as_tensor(next_goal_location, dtype=torch.float32, device=device)
-                if next_goals.ndim == 1:
-                    next_goals = next_goals.unsqueeze(0)
-                if next_goals.shape[0] != success_idx.numel():
-                    next_goals = next_goals[success_idx]
-                self.goal_location[success_idx] = self._normalize_goal_coordinates(next_goals)
-            else:
-                self._assign_random_goals(success_idx, reset_text=False)
-            if reset_text:
-                if next_goal_texts is not None:
-                    self._set_goal_texts(success_idx, next_goal_texts)
-                else:
-                    self._assign_random_texts(success_idx)
+        self._handle_success_goals(
+            success_mask,
+            next_goal_location=next_goal_location,
+            next_goal_texts=next_goal_texts,
+            reset_text=reset_text,
+        )
 
         # --- 11. Auto-reset terminated or truncated environments ---
         done_mask = terminated | truncated
@@ -865,6 +864,39 @@ class Dart272Env:
         )
         if reset_text:
             self._assign_random_texts(batch_idx)
+
+    def _handle_success_goals(
+        self,
+        success_mask: torch.Tensor,
+        next_goal_location: torch.Tensor | None = None,
+        next_goal_texts: list[str] | np.ndarray | None = None,
+        reset_text: bool = True,
+    ) -> None:
+        """Apply DART-main goal reset semantics for successful environments."""
+        if not success_mask.any():
+            return
+        success_idx = torch.where(success_mask)[0]
+        if next_goal_location is not None and next_goal_texts is not None:
+            next_goals = torch.as_tensor(
+                next_goal_location, dtype=torch.float32, device=self.device
+            )
+            if next_goals.ndim == 1:
+                next_goals = next_goals.unsqueeze(0)
+            if next_goals.shape[0] != success_idx.numel():
+                next_goals = next_goals[success_idx]
+            self.goal_location[success_idx] = self._normalize_goal_coordinates(next_goals)
+            if reset_text:
+                self._set_goal_texts(success_idx, next_goal_texts)
+        else:
+            self._assign_random_goals(success_idx, reset_text=False)
+
+    def curriculum_step(self) -> None:
+        """Advance DART-main style goal curriculum and skate-weight curriculum."""
+        self.goal_scheduler.curriculum_step()
+        self.reward_weights.weight_skate = min(
+            self.reward_weights.weight_skate + self.reward_weights.weight_skate_delta,
+            self.reward_weights.weight_skate_max,
+        )
 
     def _assign_random_texts(self, batch_idx: torch.Tensor) -> None:
         text_indices = torch.randint(len(self.locomotion_texts), (batch_idx.numel(),))

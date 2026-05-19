@@ -49,7 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--vf-coef", type=float, default=0.5)
-    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--clip-vloss", type=int, default=1)
+    parser.add_argument("--norm-adv", type=int, default=1)
+    parser.add_argument("--target-kl", type=float, default=None)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--export-interval", type=int, default=100)
@@ -59,6 +62,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", type=str, default="dart272-control")
     parser.add_argument("--auto-create-seed-data", type=int, default=1)
     parser.add_argument("--seed-data-max-files", type=int, default=256)
+    parser.add_argument("--obs-goal-angle-clip", type=float, default=180.0)
+    parser.add_argument("--obs-goal-dist-clip", type=float, default=5.0)
+    parser.add_argument("--success-threshold", type=float, default=0.3)
+    parser.add_argument("--terminate-threshold", type=float, default=100.0)
+    parser.add_argument("--goal-dist-min", type=float, default=0.5)
+    parser.add_argument("--goal-dist-max-init", type=float, default=2.0)
+    parser.add_argument("--goal-dist-max-delta", type=float, default=1.0)
+    parser.add_argument("--goal-dist-max-clamp", type=float, default=5.0)
+    parser.add_argument("--goal-angle-init", type=float, default=0.0)
+    parser.add_argument("--goal-angle-delta", type=float, default=120.0)
+    parser.add_argument("--goal-schedule-interval", type=int, default=10000)
+    parser.add_argument("--weight-success", type=float, default=10.0)
+    parser.add_argument("--weight-dist", type=float, default=1.0)
+    parser.add_argument("--weight-foot-floor", type=float, default=1.0)
+    parser.add_argument("--weight-skate", type=float, default=1.0)
+    parser.add_argument("--weight-skate-delta", type=float, default=0.0)
+    parser.add_argument("--weight-skate-max", type=float, default=1.0)
+    parser.add_argument("--weight-skate-rigid", type=float, default=0.0)
+    parser.add_argument("--weight-orient", type=float, default=1.0)
+    parser.add_argument("--weight-rotation", type=float, default=0.0)
+    parser.add_argument("--weight-jerk", type=float, default=0.0)
+    parser.add_argument("--weight-delta", type=float, default=0.0)
+    parser.add_argument("--policy-activation", type=str, default="lrelu")
+    parser.add_argument("--use-tanh-scale", type=int, default=0)
+    parser.add_argument("--use-zero-init", type=int, default=0)
     return parser.parse_args()
 
 
@@ -172,10 +200,10 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
 
     next_obs = env.reset()
     start_time = time.time()
-    next_curriculum_step = env.goal_scheduler.curriculum_interval
-
     for iteration in tqdm(range(start_iteration, args.num_iterations + 1), desc="ppo"):
-        env.global_iteration = iteration
+        env.global_iteration = iteration - 1
+        if args.goal_args.curriculum_interval > 0 and iteration % args.goal_args.curriculum_interval == 0:
+            env.curriculum_step()
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / max(args.num_iterations, 1)
             optimizer.param_groups[0]["lr"] = frac * args.learning_rate
@@ -207,9 +235,6 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
                 next_values[step] = transition_value
 
             global_step += num_envs
-            while global_step >= next_curriculum_step:
-                env.goal_scheduler.curriculum_step()
-                next_curriculum_step += env.goal_scheduler.curriculum_interval
 
             rollout_success += info["num_success"]
             rollout_terminated += info["num_terminated"]
@@ -233,11 +258,10 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
         b_advantages = advantages.reshape(batch_size)
         b_returns = returns.reshape(batch_size)
         b_values = values.reshape(batch_size)
-        b_advantages = (b_advantages - b_advantages.mean()) / (
-            b_advantages.std(unbiased=False) + 1e-8
-        )
 
         clipfracs = []
+        old_approx_kl = torch.zeros((), device=device)
+        approx_kl = torch.zeros((), device=device)
         for _ in range(args.update_epochs):
             b_inds = torch.randperm(batch_size, device=device)
             for start in range(0, batch_size, args.minibatch_size):
@@ -248,15 +272,33 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
                 with torch.no_grad():
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1.0) - logratio).mean()
                     clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
 
-                pg_loss1 = -b_advantages[mb_inds] * ratio
-                pg_loss2 = -b_advantages[mb_inds] * torch.clamp(
+                mb_advantages = b_advantages[mb_inds]
+                if args.norm_adv:
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
+
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(
                     ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef
                 )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
                 newvalue = newvalue.view(-1)
-                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                if args.clip_vloss:
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds],
+                        -args.clip_coef,
+                        args.clip_coef,
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
 
@@ -264,7 +306,8 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
-
+            if args.target_kl is not None and approx_kl > args.target_kl:
+                break
         explained_var = np.nan
         y_pred = b_values.detach().cpu().numpy()
         y_true = b_returns.detach().cpu().numpy()
@@ -280,12 +323,15 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
             "losses/value_loss": v_loss.item(),
             "losses/policy_loss": pg_loss.item(),
             "losses/entropy": entropy_loss.item(),
+            "losses/old_approx_kl": old_approx_kl.item(),
+            "losses/approx_kl": approx_kl.item(),
             "losses/clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "losses/explained_variance": float(explained_var),
             "charts/learning_rate": optimizer.param_groups[0]["lr"],
             "charts/SPS": int(global_step / max(time.time() - start_time, 1e-6)),
             "curriculum/dist_max": env.goal_scheduler.current_dist_max,
             "curriculum/angle_range": env.goal_scheduler.current_angle_range,
+            "curriculum/weight_skate": env.reward_weights.weight_skate,
         }
         for key, tensors in reward_logs.items():
             metrics[f"reward/{key}"] = torch.stack(tensors).mean().item()
@@ -334,6 +380,10 @@ def main() -> None:
         texts=cli.texts,
         guidance_scale=cli.guidance_scale,
         ddim_steps=cli.ddim_steps,
+        success_threshold=cli.success_threshold,
+        terminate_threshold=cli.terminate_threshold,
+        obs_goal_angle_clip=cli.obs_goal_angle_clip,
+        obs_goal_dist_clip=cli.obs_goal_dist_clip,
         enable_export=True,
         export_interval=cli.export_interval,
         max_export=cli.max_export,
@@ -341,16 +391,43 @@ def main() -> None:
     )
     args = TrainArgs(
         env_args=env_args,
-        policy_args=PolicyArgs(),
-        goal_args=GoalSchedulerArgs(),
-        reward_weights=RewardWeights(),
+        policy_args=PolicyArgs(
+            activation=cli.policy_activation,
+            use_tanh_scale=bool(cli.use_tanh_scale),
+            use_zero_init=bool(cli.use_zero_init),
+        ),
+        goal_args=GoalSchedulerArgs(
+            dist_min=cli.goal_dist_min,
+            dist_max_init=cli.goal_dist_max_init,
+            dist_max_delta=cli.goal_dist_max_delta,
+            dist_max_clamp=cli.goal_dist_max_clamp,
+            angle_init=cli.goal_angle_init,
+            angle_delta=cli.goal_angle_delta,
+            curriculum_interval=cli.goal_schedule_interval,
+        ),
+        reward_weights=RewardWeights(
+            weight_success=cli.weight_success,
+            weight_dist=cli.weight_dist,
+            weight_foot_floor=cli.weight_foot_floor,
+            weight_skate=cli.weight_skate,
+            weight_skate_delta=cli.weight_skate_delta,
+            weight_skate_max=cli.weight_skate_max,
+            weight_skate_rigid=cli.weight_skate_rigid,
+            weight_orient=cli.weight_orient,
+            weight_rotation=cli.weight_rotation,
+            weight_jerk=cli.weight_jerk,
+            weight_delta=cli.weight_delta,
+        ),
         learning_rate=cli.learning_rate,
         gamma=cli.gamma,
         gae_lambda=cli.gae_lambda,
         clip_coef=cli.clip_coef,
+        clip_vloss=bool(cli.clip_vloss),
+        norm_adv=bool(cli.norm_adv),
         vf_coef=cli.vf_coef,
         ent_coef=cli.ent_coef,
         max_grad_norm=cli.max_grad_norm,
+        target_kl=cli.target_kl,
         update_epochs=cli.update_epochs,
         minibatch_size=cli.minibatch_size,
         num_steps=cli.num_steps,
