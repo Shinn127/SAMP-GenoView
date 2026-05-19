@@ -87,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-activation", type=str, default="lrelu")
     parser.add_argument("--use-tanh-scale", type=int, default=0)
     parser.add_argument("--use-zero-init", type=int, default=0)
+    parser.add_argument(
+        "--inference-dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Autocast dtype for DDIM + VAE inference. Use fp16 on CUDA/MPS or bf16 on CPU for ~2x speedup.",
+    )
     return parser.parse_args()
 
 
@@ -388,6 +395,7 @@ def main() -> None:
         export_interval=cli.export_interval,
         max_export=cli.max_export,
         export_dir=str(save_dir / "rollouts"),
+        inference_dtype=cli.inference_dtype,
     )
     args = TrainArgs(
         env_args=env_args,

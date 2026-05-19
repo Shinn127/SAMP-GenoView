@@ -217,6 +217,21 @@ class Dart272Env:
                 self.clip_model, self.locomotion_texts
             ).to(device)  # [num_texts, 512]
 
+        # --- Resolve inference dtype for autocast on DDIM + VAE ---
+        self.inference_dtype = self._resolve_inference_dtype(args.inference_dtype)
+        # autocast supports cuda/cpu/mps device types; map our device accordingly
+        self.autocast_device_type = (
+            device.type if device.type in {"cuda", "cpu", "mps"} else "cpu"
+        )
+        self.autocast_enabled = self.inference_dtype != torch.float32
+
+        # If a non-fp32 inference dtype is requested, convert the heavy models
+        # (denoiser + VAE) to that dtype directly. This avoids the per-layer
+        # cast overhead of torch.autocast, which can hurt MPS/CPU throughput.
+        if self.autocast_enabled:
+            self.denoiser.to(self.inference_dtype)
+            self.vae.to(self.inference_dtype)
+
         # --- Allocate batch-dimension state tensors ---
         B = self.num_envs
         self.motion_history = torch.zeros(B, self.history_length, self.feature_dim, device=device)
@@ -234,6 +249,26 @@ class Dart272Env:
         self.global_step = 0
         self.export_dir = Path(args.export_dir) if args.export_dir else None
         self.sequences: list[dict] = [self._new_rollout_buffer() for _ in range(B)]
+
+    @staticmethod
+    def _resolve_inference_dtype(dtype_str: str) -> torch.dtype:
+        """Map a config string to a torch dtype for inference autocast."""
+        mapping = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        key = dtype_str.lower()
+        if key not in mapping:
+            raise ValueError(
+                f"Invalid inference_dtype '{dtype_str}'. "
+                f"Expected one of: {sorted(mapping)}"
+            )
+        return mapping[key]
 
     def _validate_paths(self, args: EnvArgs) -> None:
         """Validate that all required paths exist.
@@ -488,12 +523,23 @@ class Dart272Env:
         noise = action.reshape(B, self.latent_size, self.latent_width)
         obs_before_step = self.get_observation().detach()
 
+        # Cast conditioning + noise to inference dtype if non-fp32
+        # (denoiser + VAE weights have already been cast in __init__).
+        infer_dtype = self.inference_dtype
+        if self.autocast_enabled:
+            text_emb = self.goal_text_embedding.to(infer_dtype)
+            history_norm = self.motion_history.to(infer_dtype)
+            noise = noise.to(infer_dtype)
+        else:
+            text_emb = self.goal_text_embedding
+            history_norm = self.motion_history
+
         # --- 2. DDIM sampling with action as initial noise ---
         # Build model_kwargs for the denoiser (CFG wrapper)
         model_kwargs = {
             "y": {
-                "text_embedding": self.goal_text_embedding,  # [B, 512]
-                "history_motion_normalized": self.motion_history,  # [B, 2, 272]
+                "text_embedding": text_emb,           # [B, 512]
+                "history_motion_normalized": history_norm,  # [B, 2, 272]
             }
         }
 
@@ -514,23 +560,35 @@ class Dart272Env:
                     device=device,
                     dtype=torch.long,
                 )
+                # Cast x_t to inference dtype before model call. The DDIM
+                # update mixes x_t with fp32 alphas_cumprod, so it can leak
+                # back to fp32 between iterations.
+                if self.autocast_enabled:
+                    x_t = x_t.to(infer_dtype)
                 x_t = self.diffusion.ddim_sample(
                     self.denoiser, x_t, t, t_prev, model_kwargs
                 )
 
-        # x_t is now the denoised latent z: [B, 1, 256]
+        # x_t is the denoised latent z: [B, 1, 256]
         z = x_t
 
         # --- 3. VAE decode to produce 8 future frames ---
         with torch.no_grad():
             # VAE decode expects z in seq-first format: [latent_size, B, latent_width]
             z_seq_first = z.permute(1, 0, 2)  # [1, B, 256]
+            if self.autocast_enabled:
+                z_seq_first = z_seq_first.to(infer_dtype)
             motion_norm = self.vae.decode(
                 z_seq_first,
-                history_motion=self.motion_history,  # [B, 2, 272]
+                history_motion=history_norm,  # [B, 2, 272]
                 nfuture=self.future_length,  # 8
                 scale_latent=True,
             )  # [B, 8, 272]
+
+        # Cast VAE output back to fp32 so reward / world transform stays
+        # numerically stable.
+        if self.autocast_enabled:
+            motion_norm = motion_norm.to(torch.float32)
 
         # --- 4. Denormalize ---
         motion_denorm = self.denormalize(motion_norm)  # [B, 8, 272]

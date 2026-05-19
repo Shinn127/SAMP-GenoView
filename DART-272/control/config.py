@@ -40,6 +40,10 @@ class EnvArgs:
     export_interval: int = 100
     max_export: int = 16
     export_dir: str = ""
+    inference_dtype: str = "fp32"
+    """Inference dtype for DDIM + VAE blocks: fp32, fp16, or bf16.
+    Use fp16 on CUDA/MPS for ~2× throughput. Use bf16 on CPU. PPO updates
+    always run in fp32 for numerical stability."""
 
 
 @dataclass

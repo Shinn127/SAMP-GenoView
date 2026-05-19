@@ -35,6 +35,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default=None, help="Override MLD checkpoint if absent from policy ckpt.")
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--seed-data-path", type=str, default=None)
+    parser.add_argument(
+        "--inference-dtype",
+        type=str,
+        default=None,
+        choices=[None, "fp32", "fp16", "bf16"],
+        help="Override inference dtype (DDIM + VAE) at test time. Defaults to checkpoint setting.",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +69,8 @@ def load_policy_env(
         env_data["data_root"] = overrides.data_root
     if overrides.seed_data_path is not None:
         env_data["seed_data_path"] = overrides.seed_data_path
+    if getattr(overrides, "inference_dtype", None) is not None:
+        env_data["inference_dtype"] = overrides.inference_dtype
     missing = [key for key in ("checkpoint_path", "data_root", "seed_data_path") if key not in env_data]
     if missing:
         raise ValueError(
@@ -70,7 +79,7 @@ def load_policy_env(
         )
 
     env_data["num_envs"] = num_envs
-    env_data["max_steps"] = max_steps
+    env_data["max_steps"] = max_steps * 100  # Prevent auto-truncation; test loop handles advancement
     env_data["enable_export"] = True
     env_data["export_dir"] = ""
     env_args = _dataclass_from_dict(EnvArgs, env_data)
@@ -230,8 +239,11 @@ def main() -> None:
         )
         result["policy_checkpoint"] = args.policy_checkpoint
         result["policy_args"] = ckpt.get("policy_args", asdict(PolicyArgs()))
-        with (output_dir / f"{Path(args.goal_json).stem}_seq_{seq_idx}.pkl").open("wb") as f:
+        stem = f"{Path(args.goal_json).stem}_seq_{seq_idx}"
+        with (output_dir / f"{stem}.pkl").open("wb") as f:
             pickle.dump(result, f)
+        # Also save motion as .npy for direct GenoView visualization
+        np.save(output_dir / f"{stem}.npy", result["motion"])
     print(f"saved test rollouts to {output_dir}")
 
 
