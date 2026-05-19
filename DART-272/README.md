@@ -257,6 +257,56 @@ root velocity and heading, then computes loss in world space.
 
 ---
 
+## Quantitative Evaluation
+
+Evaluate text-to-motion generation quality using MotionStreamer's evaluator (FID, Diversity, R-Precision, MM-dist):
+
+```bash
+python DART-272/eval_t2m.py \
+    --checkpoint DART-272/outputs/mld_run2/checkpoint_best.pt \
+    --evaluator-dir MotionStreamer/Evaluator_272 \
+    --data-root humanml3d_272 \
+    --guidance-scale 5.0 \
+    --ddim-steps 10 \
+    --batch-size 32
+```
+
+Quick test (1 batch only):
+```bash
+python DART-272/eval_t2m.py \
+    --checkpoint DART-272/outputs/mld_run2/checkpoint_best.pt \
+    --evaluator-dir MotionStreamer/Evaluator_272 \
+    --data-root humanml3d_272 \
+    --batch-size 4 --max-batches 1
+```
+
+Parameters:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--checkpoint` | required | DART-272 MLD checkpoint |
+| `--evaluator-dir` | `../MotionStreamer/Evaluator_272` | Path to evaluator (needs `epoch=99.ckpt` and `distilbert-base-uncased/`) |
+| `--data-root` | `../humanml3d_272` | HumanML3D-272 data root |
+| `--guidance-scale` | 5.0 | Classifier-free guidance scale |
+| `--ddim-steps` | 10 | DDIM sampling steps (0 = full DDPM) |
+| `--batch-size` | 32 | Evaluation batch size |
+| `--max-batches` | 0 | Limit batches for quick testing (0 = all) |
+| `--device` | auto | Device (auto/cuda/mps/cpu) |
+
+Metrics reported:
+| Metric | Description |
+|--------|-------------|
+| FID | Fréchet Inception Distance between generated and real motion distributions (lower is better) |
+| Diversity | Variance of generated motions in latent space |
+| R-Precision Top1/2/3 | Text-motion retrieval accuracy |
+| MM-dist | Mean matching distance between text and motion embeddings (lower is better) |
+
+Prerequisites:
+- `MotionStreamer/Evaluator_272/epoch=99.ckpt` — evaluator checkpoint
+- `MotionStreamer/Evaluator_272/distilbert-base-uncased/` — DistilBERT model
+- `humanml3d_272/` — motion data, texts, split, mean_std
+
+---
+
 ## Visualization
 
 All outputs are `.npy` files with shape `[T, 272]`. Visualize with GenoView:
@@ -292,6 +342,7 @@ DART-272/
 ├── train_mvae.py            # VAE training
 ├── train_mld.py             # Denoiser training
 ├── rollout.py               # Text-conditioned generation
+├── eval_t2m.py              # Quantitative evaluation (FID, R-Precision, etc.)
 ├── optim_inbetween.py       # Motion in-betweening optimization
 ├── optim_trajectory.py      # Joint trajectory control optimization
 ├── precompute_clip.py       # CLIP embedding precomputation
@@ -316,4 +367,3 @@ DART-272/
 ## Not Yet Implemented
 
 - Scene interaction (SDF collision/contact)
-- Quantitative evaluation (FID, diversity)
