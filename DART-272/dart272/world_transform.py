@@ -5,7 +5,7 @@
   [2:8]    heading angular velocity (6D rotation of frame-to-frame heading diff)
   [8:74]   joint positions (22 joints * 3, no heading, at XZ origin)
   [74:140] joint velocities (22 joints * 3)
-  [140:272] joint rotations 6D + foot contact
+  [140:272] joint rotations 6D (22 joints × 6)
 
 This module provides a differentiable function to convert root-relative
 joint positions to world coordinates by accumulating root velocity and heading.

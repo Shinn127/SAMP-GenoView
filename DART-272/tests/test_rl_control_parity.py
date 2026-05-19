@@ -159,7 +159,10 @@ class RLControlParityTests(unittest.TestCase):
 
             sequence = load_goal_sequences(str(path))[0]
 
-        self.assertEqual(sequence["goal_location"], [[0.0, 0.0, 4.0], [1.0, 0.0, 2.0]])
+        # [0.0, 4.0, 0.0] is Y-up [x, y, z]: X=0, Y=4 (height, discarded), Z=0
+        # _goal_from_xy keeps X and Z, sets Y=0 → [0.0, 0.0, 0.0]
+        # [1.0, 0.0, 2.0] has Y=0 so it passes through unchanged
+        self.assertEqual(sequence["goal_location"], [[0.0, 0.0, 0.0], [1.0, 0.0, 2.0]])
         self.assertEqual(sequence["goal_text"], ["walk", "run"])
 
 

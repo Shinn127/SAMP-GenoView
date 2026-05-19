@@ -405,6 +405,8 @@ class Dart272Env:
             start_idx = torch.randint(max_start + 1, (1,)).item()
 
             # 2. Set motion history (normalized) — 2 consecutive frames
+            #    Keep the original data UNMODIFIED so that the denoiser sees
+            #    the same distribution it was trained on.
             self.motion_history[idx] = seed_motion[start_idx : start_idx + 2]
 
             # 3. Set denormalized motion history
@@ -412,8 +414,34 @@ class Dart272Env:
                 self.motion_history[idx]
             )
 
-            # 4. Set transf_rotmat to identity
-            self.transf_rotmat[idx] = torch.eye(3, device=self.device)
+            # 4. Compute the true accumulated heading at start_idx and set
+            #    transf_rotmat so that the character's world-frame forward
+            #    direction is +Z regardless of where in the sequence we start.
+            #
+            #    The 272-dim heading_6d[t] is a frame-to-frame delta rotation.
+            #    cumulative_rotation gives: R[0]=delta[0], R[t]=delta[t]@R[t-1]
+            #    When we take a segment starting at start_idx, the segment's
+            #    local frame has its own heading starting from delta[start_idx].
+            #
+            #    local_to_world_joints on the 2-frame segment will produce
+            #    joints in a "segment-local" frame where:
+            #      - frame 0 heading = delta_rot[start_idx] (NOT identity)
+            #      - root position starts at origin
+            #
+            #    We set transf_rotmat = inverse(delta_rot[start_idx]) so that
+            #    when we transform segment-local coords to world:
+            #      world = transf_rotmat @ segment_local
+            #    the initial heading in world frame becomes identity (facing +Z).
+            #
+            #    This preserves the original motion data (no modification to
+            #    heading or velocity channels) while ensuring correct world
+            #    frame alignment.
+            from dart272.world_transform import rotation_6d_to_matrix
+            first_heading_6d = self.motion_history_denorm[idx, 0, 2:8]  # [6]
+            first_heading_rot = rotation_6d_to_matrix(first_heading_6d)  # [3, 3]
+            # transf_rotmat = inverse of first frame's heading delta
+            # so that world_heading at frame 0 = transf_rotmat @ first_heading = identity
+            self.transf_rotmat[idx] = first_heading_rot.T  # R^{-1} = R^T for rotation matrices
 
             # 5. Calibrate floor height so lowest foot joint Y = 0
             # Use local_to_world_joints on the 2-frame segment with identity transform
@@ -729,7 +757,7 @@ class Dart272Env:
         Goal direction is computed in the local (heading-removed) frame:
         1. Compute world-frame direction from pelvis to goal on XZ plane
         2. Transform to local frame via transf_rotmat.T (inverse heading rotation)
-        3. If angle to forward direction [1, 0, 0] exceeds obs_goal_angle_clip,
+        3. If angle to forward direction [0, 0, 1] exceeds obs_goal_angle_clip,
            project onto the cone boundary while preserving unit norm
 
         Returns:
@@ -756,7 +784,7 @@ class Dart272Env:
         # For zero-distance, default to forward direction in world frame
         if (~nonzero_mask).any():
             goal_dir_world[~nonzero_mask] = (
-                self.transf_rotmat[~nonzero_mask] @ torch.tensor([1.0, 0.0, 0.0], device=device)
+                self.transf_rotmat[~nonzero_mask] @ torch.tensor([0.0, 0.0, 1.0], device=device)
             )
 
         # Transform to local frame: local_dir = R^T @ world_dir
@@ -766,17 +794,17 @@ class Dart272Env:
         )  # [B, 3]
 
         # --- Cone clamping ---
-        # Forward direction in local frame is [1, 0, 0] (X-axis, consistent with
-        # the heading rotation convention where identity heading = facing +X)
-        forward_local = torch.tensor([1.0, 0.0, 0.0], device=device)  # [3]
+        # Forward direction in local frame is [0, 0, 1] (Z-axis, consistent with
+        # the HumanML3D-272 convention where identity heading = facing +Z)
+        forward_local = torch.tensor([0.0, 0.0, 1.0], device=device)  # [3]
         max_angle_rad = torch.deg2rad(
             torch.tensor(self.args.obs_goal_angle_clip, device=device)
         )
 
-        # Compute angle between local_goal_dir and forward [1, 0, 0]
+        # Compute angle between local_goal_dir and forward [0, 0, 1]
         # cos(angle) = dot(local_goal_dir, forward) / (||local_goal_dir|| * ||forward||)
-        # Since both should be unit vectors: cos(angle) = local_goal_dir[..., 0]
-        cos_angle = local_goal_dir[:, 0].clamp(-1.0, 1.0)  # [B]
+        # Since both should be unit vectors: cos(angle) = local_goal_dir[..., 2]
+        cos_angle = local_goal_dir[:, 2].clamp(-1.0, 1.0)  # [B]
         angle = torch.acos(cos_angle)  # [B]
 
         # Identify directions that exceed the maximum angle
@@ -785,22 +813,22 @@ class Dart272Env:
         if needs_clamping.any():
             # For directions exceeding the cone, project onto cone boundary
             # Decompose local_goal_dir into forward component and lateral component
-            # forward component: local_goal_dir[:, 0] * [1, 0, 0]
-            # lateral component: local_goal_dir - forward_component (lies in YZ plane of local frame)
+            # forward component: local_goal_dir[:, 2] * [0, 0, 1]
+            # lateral component: local_goal_dir - forward_component (lies in XY plane of local frame)
             clamped_dirs = local_goal_dir.clone()
             idx = needs_clamping
 
-            # Lateral component (perpendicular to forward [1,0,0] in local frame)
+            # Lateral component (perpendicular to forward [0,0,1] in local frame)
             lateral = clamped_dirs[idx].clone()
-            lateral[:, 0] = 0.0  # Remove forward (X) component
+            lateral[:, 2] = 0.0  # Remove forward (Z) component
 
             lateral_norm = torch.norm(lateral, dim=-1, keepdim=True)
 
             # Handle degenerate case: goal exactly along forward axis (lateral = 0)
-            # Pick arbitrary perpendicular direction [0, 0, 1]
+            # Pick arbitrary perpendicular direction [1, 0, 0]
             degenerate = (lateral_norm.squeeze(-1) < 1e-8)
             if degenerate.any():
-                lateral[degenerate] = torch.tensor([0.0, 0.0, 1.0], device=device)
+                lateral[degenerate] = torch.tensor([1.0, 0.0, 0.0], device=device)
                 lateral_norm[degenerate] = 1.0
 
             lateral_unit = lateral / lateral_norm.clamp(min=1e-8)
@@ -911,7 +939,7 @@ class Dart272Env:
     def _assign_random_goals(self, batch_idx: torch.Tensor, reset_text: bool = True) -> None:
         count = batch_idx.numel()
         pelvis_positions = self.prev_pelvis_pos[batch_idx]
-        local_forward = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+        local_forward = torch.tensor([0.0, 0.0, 1.0], device=self.device)
         forward_dir = torch.einsum(
             "bij,j->bi", self.transf_rotmat[batch_idx], local_forward
         )

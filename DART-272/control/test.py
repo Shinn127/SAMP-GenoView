@@ -100,7 +100,8 @@ def _goal_from_xy(location: list[float]) -> list[float]:
     if len(location) == 2:
         return [float(location[0]), 0.0, float(location[1])]
     if len(location) == 3:
-        return [float(location[0]), 0.0, float(location[1])]
+        # Assume Y-up [x, y, z] — keep X and Z, discard Y
+        return [float(location[0]), 0.0, float(location[2])]
     raise ValueError(f"Goal location must contain 2 or 3 values, got {location}")
 
 
