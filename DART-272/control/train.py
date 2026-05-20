@@ -37,7 +37,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument("--num-steps", type=int, default=32)
-    parser.add_argument("--num-iterations", type=int, default=500)
+    parser.add_argument("--num-iterations", type=int, default=None,
+                        help="Total training iterations. If --total-timesteps is set, this is computed automatically.")
+    parser.add_argument("--total-timesteps", type=int, default=None,
+                        help="Total environment timesteps (like DART-main). Computes num_iterations = total_timesteps // (num_envs * num_steps).")
     parser.add_argument("--max-episode-steps", type=int, default=256)
     parser.add_argument("--texts", type=str, nargs="+", default=["walk", "run", "hop on left leg"])
     parser.add_argument("--guidance-scale", type=float, default=5.0)
@@ -374,6 +377,16 @@ def train(args: TrainArgs, device: torch.device, resume: str | None = None) -> N
 
 def main() -> None:
     cli = parse_args()
+
+    # Compute num_iterations from total_timesteps (DART-main style)
+    if cli.total_timesteps is not None:
+        cli.num_iterations = cli.total_timesteps // (cli.num_envs * cli.num_steps)
+        print(f"[info] total_timesteps={cli.total_timesteps}, "
+              f"num_envs={cli.num_envs}, num_steps={cli.num_steps} "
+              f"=> num_iterations={cli.num_iterations}")
+    elif cli.num_iterations is None:
+        cli.num_iterations = 500  # fallback default
+
     if cli.auto_create_seed_data:
         prepare_seed_data(cli.data_root, cli.seed_data_path, cli.seed_data_max_files)
     device = resolve_device(cli.device)
